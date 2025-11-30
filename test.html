@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>资源排班一览 - 原型</title>
+  <style>
+    :root {
+      --bg: #f5f7fa;
+      --card-bg: #ffffff;
+      --border: #e0e4eb;
+      --border-soft: #edf0f5;
+      --primary: #2563eb;
+      --primary-soft: #e3edff;
+      --primary-dark: #1d4ed8;
+      --text-main: #111827;
+      --text-sub: #6b7280;
+      --text-light: #9ca3af;
+      --danger: #dc2626;
+      --radius-card: 12px;
+      --radius-pill: 999px;
+      --shadow-soft: 0 10px 30px rgba(15, 23, 42, 0.10);
+    }
+    * {
+      box-sizing: border-box;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "PingFang SC",
+        "Microsoft YaHei", sans-serif;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text-main);
+    }
+    .page {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      padding: 24px;
+      gap: 16px;
+    }
+    .page-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .page-title {
+      font-size: 22px;
+      font-weight: 600;
+    }
+    .page-subtitle {
+      font-size: 12px;
+      color: var(--text-sub);
+      margin-top: 4px;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: var(--card-bg);
+      padding: 12px 16px;
+      border-radius: var(--radius-card);
+      border: 1px solid var(--border-soft);
+      box-shadow: 0 4px 10px rgba(15, 23, 42, 0.02);
+    }
+    .toolbar-left,
+    .toolbar-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .field-label {
+      font-size: 13px;
+      color: var(--text-sub);
+      margin-right: 4px;
+    }
+    .input,
+    .select,
+    .button {
+      font-size: 13px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #fff;
+      color: var(--text-main);
+      outline: none;
+    }
+    .input:focus,
+    .select:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.15);
+    }
+    .button {
+      cursor: pointer;
+      border-radius: var(--radius-pill);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+    }
+    .button-primary {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+    .button-primary:hover {
+      background: var(--primary-dark);
+    }
+    .button-soft {
+      background: #fff;
+      border-color: var(--border);
+      color: var(--text-sub);
+    }
+    .button-soft:hover {
+      border-color: var(--primary);
+      color: var(--primary-dark);
+    }
+    .button-ghost {
+      background: transparent;
+      border-color: transparent;
+      color: var(--text-sub);
+    }
+    .button-ghost:hover {
+      background: #e5e7eb;
+    }
+    .segmented {
+      display: inline-flex;
+      border-radius: var(--radius-pill);
+      border: 1px solid var(--border);
+      overflow: hidden;
+      background: #f9fafb;
+    }
+    .segmented button {
+      border: none;
+      padding: 6px 10px;
+      font-size: 12px;
+      background: transparent;
+      cursor: pointer;
+      color: var(--text-sub);
+      min-width: 68px;
+    }
+    .segmented button.active {
+      background: #fff;
+      color: var(--primary-dark);
+      font-weight: 500;
+      box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.1);
+    }
+
+    .switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-sub);
+      cursor: pointer;
+    }
+    .switch-track {
+      width: 32px;
+      height: 18px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      padding: 2px;
+      box-sizing: border-box;
+      transition: background 0.2s;
+    }
+    .switch-thumb {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: #fff;
+      transition: transform 0.2s;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+    }
+    .switch.on .switch-track {
+      background: var(--primary);
+    }
+    .switch.on .switch-thumb {
+      transform: translateX(14px);
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 16px;
+      position: relative;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border-radius: var(--radius-card);
+      border: 1px solid var(--border-soft);
+      padding: 12px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.03);
+      overflow: hidden;
+    }
+
+    .schedule-table-wrapper {
+      overflow: auto;
+      max-height: calc(100vh - 170px);
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      min-width: 900px;
+      font-size: 13px;
+    }
+    thead {
+      background: #f9fafb;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    th,
+    td {
+      border-bottom: 1px solid var(--border-soft);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+    th {
+      font-weight: 500;
+      color: var(--text-sub);
+    }
+    tbody tr:hover td {
+      background: #f9fafb;
+    }
+    .col-resource,
+    .col-template {
+      position: sticky;
+      left: 0;
+      background: #fff;
+      z-index: 1;
+    }
+    .col-template {
+      left: 140px;
+      border-left: 1px solid var(--border-soft);
+    }
+    .resource-name {
+      font-weight: 500;
+    }
+    .template-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 8px;
+      border-radius: var(--radius-pill);
+      border: 1px solid var(--border-soft);
+      background: #f9fafb;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .template-pill span {
+      max-width: 120px;
+      text-overflow: ellipsis;
+      overflow: hidden;
+    }
+    .template-pill:hover {
+      border-color: var(--primary);
+      background: var(--primary-soft);
+      color: var(--primary-dark);
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 6px;
+      border-radius: var(--radius-pill);
+      background: #eef2ff;
+      color: #4338ca;
+      font-size: 11px;
+      margin: 1px 2px 1px 0;
+    }
+    .chip-muted {
+      background: #f3f4f6;
+      color: #4b5563;
+    }
+    .chip-outline {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      color: #4b5563;
+    }
+    .chip-exception {
+      background: #fef2f2;
+      color: #b91c1c;
+    }
+    .cell-schedule {
+      cursor: pointer;
+      min-width: 120px;
+    }
+    .cell-schedule .hint {
+      font-size: 11px;
+      color: var(--text-light);
+      margin-top: 2px;
+    }
+    .row-actions {
+      text-align: right;
+    }
+
+    /* Drawer & Modals */
+    .overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.24);
+      display: none;
+      z-index: 20;
+    }
+    .overlay.show {
+      display: block;
+    }
+
+    .drawer {
+      position: fixed;
+      top: 0;
+      right: -420px;
+      width: 420px;
+      height: 100vh;
+      background: #ffffff;
+      box-shadow: -10px 0 30px rgba(15, 23, 42, 0.20);
+      transition: right 0.25s ease;
+      z-index: 30;
+      display: flex;
+      flex-direction: column;
+    }
+    .drawer.show {
+      right: 0;
+    }
+    .drawer-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border-soft);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .drawer-title {
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .drawer-body {
+      padding: 16px 20px 80px;
+      flex: 1;
+      overflow: auto;
+    }
+    .drawer-footer {
+      position: sticky;
+      bottom: 0;
+      padding: 12px 20px;
+      border-top: 1px solid var(--border-soft);
+      background: #fff;
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: 80px 1fr;
+      gap: 10px 8px;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+    .form-label {
+      text-align: right;
+      color: var(--text-sub);
+      padding-top: 6px;
+    }
+    .form-control {
+      width: 100%;
+    }
+
+    .section-title {
+      font-size: 13px;
+      font-weight: 600;
+      margin: 12px 0 6px;
+    }
+    .section-sub {
+      font-size: 11px;
+      color: var(--text-sub);
+      margin-bottom: 6px;
+    }
+
+    .time-slice-list {
+      border-radius: 8px;
+      border: 1px solid var(--border-soft);
+      background: #f9fafb;
+      padding: 8px;
+      max-height: 230px;
+      overflow: auto;
+    }
+    .slice-row {
+      display: grid;
+      grid-template-columns: 80px 1fr 1fr 32px;
+      gap: 4px;
+      align-items: center;
+      margin-bottom: 4px;
+      background: #fff;
+      border-radius: 6px;
+      padding: 4px;
+      border: 1px solid var(--border-soft);
+    }
+    .slice-name {
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .slice-meta {
+      font-size: 11px;
+      color: var(--text-sub);
+    }
+    .slice-tag {
+      font-size: 11px;
+      border-radius: var(--radius-pill);
+      padding: 1px 6px;
+      background: #ecfeff;
+      color: #0891b2;
+      margin-top: 2px;
+      display: inline-block;
+    }
+    .slice-tag-template {
+      background: #eef2ff;
+      color: #4f46e5;
+    }
+
+    .text-muted {
+      color: var(--text-sub);
+      font-size: 12px;
+    }
+
+    .icon-btn {
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      border: 1px solid var(--border-soft);
+      background: #fff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 14px;
+      color: var(--text-sub);
+    }
+    .icon-btn:hover {
+      border-color: var(--primary);
+      color: var(--primary-dark);
+    }
+
+    .exception-list {
+      border-radius: 8px;
+      border: 1px dashed #e5e7eb;
+      padding: 8px;
+      background: #f9fafb;
+      max-height: 180px;
+      overflow: auto;
+    }
+    .exception-row {
+      display: grid;
+      grid-template-columns: 80px 1fr 24px;
+      gap: 4px;
+      align-items: center;
+      margin-bottom: 4px;
+      background: #fff;
+      border-radius: 6px;
+      padding: 4px;
+      border: 1px solid var(--border-soft);
+      font-size: 12px;
+    }
+    .exception-product {
+      font-weight: 500;
+    }
+    .exception-time {
+      font-size: 11px;
+      color: var(--text-sub);
+    }
+
+    /* Centered modal */
+    .modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 40;
+    }
+    .modal.show {
+      display: flex;
+    }
+    .modal-card {
+      width: 480px;
+      max-width: 92vw;
+      background: #fff;
+      border-radius: 14px;
+      box-shadow: var(--shadow-soft);
+      border: 1px solid var(--border-soft);
+      padding: 18px 20px 12px;
+      display: flex;
+      flex-direction: column;
+      max-height: 80vh;
+    }
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .modal-title {
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .modal-body {
+      flex: 1;
+      overflow: auto;
+      padding-right: 4px;
+    }
+    .modal-footer {
+      margin-top: 10px;
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .mode-list {
+      font-size: 13px;
+      list-style: none;
+      padding-left: 0;
+      margin: 6px 0 0;
+    }
+    .mode-list li {
+      margin-bottom: 6px;
+      border-radius: 8px;
+      border: 1px solid var(--border-soft);
+      padding: 6px 8px;
+    }
+    .mode-title {
+      font-weight: 500;
+    }
+    .mode-desc {
+      font-size: 11px;
+      color: var(--text-sub);
+    }
+
+    .tag-danger {
+      font-size: 11px;
+      color: var(--danger);
+      background: #fef2f2;
+      border-radius: var(--radius-pill);
+      padding: 2px 6px;
+      margin-left: 6px;
+    }
+
+    @media (max-width: 960px) {
+      .page {
+        padding: 12px;
+      }
+      .toolbar {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .col-resource {
+        left: 0;
+      }
+      .col-template {
+        left: 120px;
+      }
+      .drawer {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+  <div class="page-header">
+    <div>
+      <div class="page-title">资源排班一览</div>
+      <div class="page-subtitle">点击模板可编辑排班计划，点击单元格可编辑当日排班明细</div>
+    </div>
+  </div>
+
+  <!-- 顶部工具栏 -->
+  <div class="toolbar">
+    <div class="toolbar-left">
+      <span class="field-label">日期范围</span>
+      <input class="input" type="date" value="2025-12-01" />
+      <span>~</span>
+      <input class="input" type="date" value="2025-12-07" />
+
+      <button class="button button-soft">今天</button>
+      <button class="button button-soft">本周</button>
+      <button class="button button-soft">本月</button>
+      <button class="button button-soft">未来30天</button>
+    </div>
+    <div class="toolbar-right">
+      <div class="segmented">
+        <button class="active">班次视图</button>
+        <button>有效时间视图</button>
+      </div>
+      <label class="switch">
+        <div class="switch-track"><div class="switch-thumb"></div></div>
+        显示可用例外
+      </label>
+    </div>
+  </div>
+
+  <div class="layout">
+    <div class="card">
+      <div class="schedule-table-wrapper">
+        <table>
+          <thead>
+          <tr>
+            <th class="col-resource">资源</th>
+            <th class="col-template">默认排班模板</th>
+            <th>2025-12-01<br><span class="text-muted">周一</span></th>
+            <th>2025-12-02<br><span class="text-muted">周二</span></th>
+            <th>2025-12-03<br><span class="text-muted">周三</span></th>
+            <th>2025-12-04<br><span class="text-muted">周四</span></th>
+            <th>2025-12-05<br><span class="text-muted">周五</span></th>
+            <th>操作</th>
+          </tr>
+          </thead>
+          <tbody>
+          <!-- 产线A -->
+          <tr>
+            <td class="col-resource">
+              <div class="resource-name">产线 A</div>
+              <div class="text-muted" style="font-size:11px;">ProductionLineA</div>
+            </td>
+            <td class="col-template">
+              <div class="template-pill" data-open-plan="产线 A">
+                <span>白班模板</span>
+                <span style="font-size:11px;color:var(--text-sub);">08:00-12:00, 13:00-17:00</span>
+              </div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 A|2025-12-01">
+              <div>
+                <span class="chip">白班 8h</span>
+                <span class="chip chip-muted">加班 2h</span>
+              </div>
+              <div class="chip chip-exception">产品 A 不可用 24h</div>
+              <div class="hint">点击编辑</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 A|2025-12-02">
+              <div class="chip chip-muted">休息</div>
+              <div class="hint">点击编辑</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 A|2025-12-03">
+              <div class="chip chip-outline">未排班</div>
+              <div class="hint">点击新建排班</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 A|2025-12-04">
+              <div class="chip">白班 8h</div>
+              <div class="hint">点击编辑</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 A|2025-12-05">
+              <div class="chip chip-outline">未排班</div>
+              <div class="hint">点击新建排班</div>
+            </td>
+            <td class="row-actions">
+              <button class="button button-soft" data-open-roll="产线 A">滚动排班</button>
+            </td>
+          </tr>
+
+          <!-- 产线B -->
+          <tr>
+            <td class="col-resource">
+              <div class="resource-name">产线 B</div>
+              <div class="text-muted" style="font-size:11px;">ProductionLineB</div>
+            </td>
+            <td class="col-template">
+              <div class="template-pill" data-open-plan="产线 B">
+                <span>夜班模板</span>
+                <span style="font-size:11px;color:var(--text-sub);">20:00-24:00, 00:00-04:00</span>
+              </div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 B|2025-12-01">
+              <div class="chip">夜班 8h</div>
+              <div class="hint">点击编辑</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 B|2025-12-02">
+              <div class="chip chip-muted">加班 4h</div>
+              <div class="hint">点击编辑</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 B|2025-12-03">
+              <div class="chip chip-outline">未排班</div>
+              <div class="hint">点击新建排班</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 B|2025-12-04">
+              <div class="chip">夜班 8h</div>
+              <div class="chip chip-exception">产品 C 不可用 12h</div>
+              <div class="hint">点击编辑</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="产线 B|2025-12-05">
+              <div class="chip chip-outline">未排班</div>
+              <div class="hint">点击新建排班</div>
+            </td>
+            <td class="row-actions">
+              <button class="button button-soft" data-open-roll="产线 B">滚动排班</button>
+            </td>
+          </tr>
+
+          <!-- 模具 X 示例 -->
+          <tr>
+            <td class="col-resource">
+              <div class="resource-name">模具 X</div>
+              <div class="text-muted" style="font-size:11px;">MoldX</div>
+            </td>
+            <td class="col-template">
+              <div class="template-pill" data-open-plan="模具 X">
+                <span>标准模板</span>
+                <span style="font-size:11px;color:var(--text-sub);">08:00-20:00</span>
+              </div>
+            </td>
+            <td class="cell-schedule" data-open-detail="模具 X|2025-12-01">
+              <div class="chip">标准 12h</div>
+              <div class="chip chip-exception">产品 A 不可用 24h</div>
+              <div class="chip chip-exception">产品 B 不可用 12h</div>
+              <div class="hint">点击查看可用例外</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="模具 X|2025-12-02">
+              <div class="chip">标准 12h</div>
+              <div class="hint">点击编辑</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="模具 X|2025-12-03">
+              <div class="chip chip-outline">未排班</div>
+              <div class="hint">点击新建排班</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="模具 X|2025-12-04">
+              <div class="chip">标准 12h</div>
+              <div class="hint">点击编辑</div>
+            </td>
+            <td class="cell-schedule" data-open-detail="模具 X|2025-12-05">
+              <div class="chip">标准 12h</div>
+              <div class="hint">点击编辑</div>
+            </td>
+            <td class="row-actions">
+              <button class="button button-soft" data-open-roll="模具 X">滚动排班</button>
+            </td>
+          </tr>
+
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 遮罩 -->
+<div class="overlay" id="overlay"></div>
+
+<!-- 排班明细编辑抽屉 -->
+<div class="drawer" id="detailDrawer">
+  <div class="drawer-header">
+    <div class="drawer-title" id="detailTitle">编辑排班 - 产线A - 2025-12-01</div>
+    <button class="icon-btn" onclick="closeDetailDrawer()">✕</button>
+  </div>
+  <div class="drawer-body">
+    <div class="form-grid">
+      <div class="form-label">资源</div>
+      <div class="form-control"><input class="input" value="产线 A" disabled /></div>
+      <div class="form-label">日期</div>
+      <div class="form-control"><input class="input" value="2025-12-01" disabled /></div>
+      <div class="form-label">当前模板</div>
+      <div class="form-control">
+        <select class="select">
+          <option>白班模板</option>
+          <option>夜班模板</option>
+          <option>标准模板</option>
+        </select>
+        <div class="text-muted" style="margin-top:4px;">
+          切换模板将覆盖模板时间片，保留手动新增的时间片。
+        </div>
+      </div>
+    </div>
+
+    <div class="section-title">排班时间片</div>
+    <div class="section-sub">
+      支持跨天，例如 2025-12-01 22:00 ~ 2025-12-02 06:00。
+      <span class="tag-danger">示例数据，仅演示结构</span>
+    </div>
+    <div class="time-slice-list">
+      <div class="slice-row">
+        <div>
+          <div class="slice-name">白班</div>
+          <div class="slice-meta">类型：normal</div>
+          <div class="slice-tag slice-tag-template">模板时间片</div>
+        </div>
+        <div>
+          <input class="input" type="datetime-local" value="2025-12-01T08:00" style="width:100%;" />
+        </div>
+        <div>
+          <input class="input" type="datetime-local" value="2025-12-01T12:00" style="width:100%;" />
+        </div>
+        <div style="text-align:right;">
+          <button class="icon-btn" title="删除">🗑</button>
+        </div>
+      </div>
+
+      <div class="slice-row">
+        <div>
+          <div class="slice-name">休息</div>
+          <div class="slice-meta">类型：leave</div>
+          <div class="slice-tag">手动时间片</div>
+        </div>
+        <div>
+          <input class="input" type="datetime-local" value="2025-12-01T12:00" style="width:100%;" />
+        </div>
+        <div>
+          <input class="input" type="datetime-local" value="2025-12-01T14:00" style="width:100%;" />
+        </div>
+        <div style="text-align:right;">
+          <button class="icon-btn" title="删除">🗑</button>
+        </div>
+      </div>
+
+      <div class="slice-row">
+        <div>
+          <div class="slice-name">加班</div>
+          <div class="slice-meta">类型：overtime</div>
+          <div class="slice-tag">手动时间片</div>
+        </div>
+        <div>
+          <input class="input" type="datetime-local" value="2025-12-01T19:00" style="width:100%;" />
+        </div>
+        <div>
+          <input class="input" type="datetime-local" value="2025-12-02T01:00" style="width:100%;" />
+          <div class="slice-meta">跨天</div>
+        </div>
+        <div style="text-align:right;">
+          <button class="icon-btn" title="删除">🗑</button>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:6px;">
+      <button class="button button-soft">+ 添加时间片</button>
+    </div>
+
+    <div class="section-title" style="margin-top:16px;">可用例外（产品维度）</div>
+    <div class="section-sub">
+      不影响资源本身可用时长，只用于限制特定产品在该时间段内不可用。
+    </div>
+    <div class="exception-list">
+      <div class="exception-row">
+        <div class="exception-product">产品 A</div>
+        <div>
+          <div class="exception-time">2025-12-01 00:00 ~ 2025-12-02 00:00</div>
+        </div>
+        <div style="text-align:right;">
+          <button class="icon-btn" title="删除">🗑</button>
+        </div>
+      </div>
+      <div class="exception-row">
+        <div class="exception-product">产品 B</div>
+        <div>
+          <div class="exception-time">2025-12-01 08:00 ~ 2025-12-01 20:00</div>
+        </div>
+        <div style="text-align:right;">
+          <button class="icon-btn" title="删除">🗑</button>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:6px;">
+      <button class="button button-soft">+ 添加可用例外</button>
+    </div>
+  </div>
+  <div class="drawer-footer">
+    <button class="button button-soft" onclick="closeDetailDrawer()">取消</button>
+    <button class="button button-primary">保存</button>
+  </div>
+</div>
+
+<!-- 排班计划编辑 Modal -->
+<div class="modal" id="planModal">
+  <div class="modal-card">
+    <div class="modal-header">
+      <div class="modal-title" id="planTitle">编辑排班计划 - 产线 A</div>
+      <button class="icon-btn" onclick="closePlanModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="form-label">资源</div>
+        <div class="form-control"><input class="input" value="产线 A" disabled /></div>
+
+        <div class="form-label">默认模板</div>
+        <div class="form-control">
+          <select class="select">
+            <option>白班模板（08:00-12:00, 13:00-17:00）</option>
+            <option>夜班模板（20:00-24:00, 00:00-04:00）</option>
+            <option>标准模板（08:00-20:00）</option>
+          </select>
+        </div>
+
+        <div class="form-label">滚动排班</div>
+        <div class="form-control">
+          <label class="switch on">
+            <div class="switch-track"><div class="switch-thumb"></div></div>
+            已开启
+          </label>
+          <div class="text-muted" style="margin-top:4px;">
+            开启后系统将自动为该资源生成未来若干天的排班。
+          </div>
+        </div>
+
+        <div class="form-label">步长（天）</div>
+        <div class="form-control">
+          <input class="input" type="number" value="30" />
+          <div class="text-muted" style="margin-top:4px;">
+            每次滚动时向后生成的天数，例如 30 天。
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="button button-soft" onclick="closePlanModal()">取消</button>
+      <button class="button button-primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 滚动排班 Modal -->
+<div class="modal" id="rollModal">
+  <div class="modal-card">
+    <div class="modal-header">
+      <div class="modal-title" id="rollTitle">滚动排班 - 产线 A</div>
+      <button class="icon-btn" onclick="closeRollModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="form-label">日期范围</div>
+        <div class="form-control">
+          <input class="input" type="date" value="2025-12-01" />
+          <span style="margin:0 4px;">~</span>
+          <input class="input" type="date" value="2026-01-01" />
+        </div>
+
+        <div class="form-label">排班模式</div>
+        <div class="form-control">
+          <ul class="mode-list">
+            <li>
+              <label>
+                <input type="radio" name="rollMode" checked />
+                <span class="mode-title">仅填空白日期</span>
+              </label>
+              <div class="mode-desc">
+                只为当前没有任何排班明细的日期生成排班，不修改已有明细。
+              </div>
+            </li>
+            <li>
+              <label>
+                <input type="radio" name="rollMode" />
+                <span class="mode-title">覆盖模板时间片</span>
+              </label>
+              <div class="mode-desc">
+                仅删除原由模板生成的时间片，保留手动时间片，然后按默认模板重新生成。
+              </div>
+            </li>
+            <li>
+              <label>
+                <input type="radio" name="rollMode" />
+                <span class="mode-title">全部覆盖</span>
+              </label>
+              <div class="mode-desc">
+                删除所选日期范围内的所有时间片（包括手动），完全按默认模板重建。
+              </div>
+            </li>
+          </ul>
+        </div>
+
+        <div class="form-label">提示</div>
+        <div class="form-control">
+          <label style="font-size:12px;color:var(--text-sub);">
+            <input type="checkbox" checked />
+            若日期包含已维护可用例外，执行后在结果日志中提醒我。
+          </label>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="button button-soft" onclick="closeRollModal()">取消</button>
+      <button class="button button-primary">执行滚动排班</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const overlay = document.getElementById('overlay');
+  const detailDrawer = document.getElementById('detailDrawer');
+  const detailTitle = document.getElementById('detailTitle');
+  const planModal = document.getElementById('planModal');
+  const planTitle = document.getElementById('planTitle');
+  const rollModal = document.getElementById('rollModal');
+  const rollTitle = document.getElementById('rollTitle');
+
+  function openOverlay() {
+    overlay.classList.add('show');
+  }
+  function closeOverlay() {
+    overlay.classList.remove('show');
+  }
+
+  function openDetailDrawer(text) {
+    detailTitle.textContent = '编辑排班 - ' + text;
+    detailDrawer.classList.add('show');
+    openOverlay();
+  }
+  function closeDetailDrawer() {
+    detailDrawer.classList.remove('show');
+    closeOverlay();
+  }
+
+  function openPlanModal(resource) {
+    planTitle.textContent = '编辑排班计划 - ' + resource;
+    planModal.classList.add('show');
+    openOverlay();
+  }
+  function closePlanModal() {
+    planModal.classList.remove('show');
+    closeOverlay();
+  }
+
+  function openRollModal(resource) {
+    rollTitle.textContent = '滚动排班 - ' + resource;
+    rollModal.classList.add('show');
+    openOverlay();
+  }
+  function closeRollModal() {
+    rollModal.classList.remove('show');
+    closeOverlay();
+  }
+
+  // 绑定单元格点击事件
+  document.querySelectorAll('[data-open-detail]').forEach(el => {
+    el.addEventListener('click', () => {
+      openDetailDrawer(el.getAttribute('data-open-detail'));
+    });
+  });
+  document.querySelectorAll('[data-open-plan]').forEach(el => {
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      openPlanModal(el.getAttribute('data-open-plan'));
+    });
+  });
+  document.querySelectorAll('[data-open-roll]').forEach(el => {
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      openRollModal(el.getAttribute('data-open-roll'));
+    });
+  });
+
+  // 点击遮罩关闭所有弹层
+  overlay.addEventListener('click', () => {
+    closeDetailDrawer();
+    closePlanModal();
+    closeRollModal();
+  });
+</script>
+</body>
+</html>
