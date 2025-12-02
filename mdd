@@ -1,34 +1,391 @@
-这个需求本质上就是：**把可用时间片当成“白底”，不可用时间片当成“橡皮擦”，先把所有可用时间片合并，再用不可用时间片去抹掉重叠部分**，得到最终有效时间段 + 有效可用时长。
+下面是**完整的实现版**，已经把：
 
-下面按你现有 `App.tsx` 来说怎么改（只动这一块逻辑）。
+* ✅ 有效时间段 + 有效可用时长（考虑请假/故障/保养等不可用时间片、优先扣减）
+* ✅ 批量添加时间片（不需要先选中资源）
+* ✅ Excel 导入 / 导出资源排班计划 + 排班详情（时间片粒度，表头中文，时间片非 JSON）
 
----
+全部合并进 `App.tsx`，并给出对应的 `App.css`（只在原基础上稍微补了点样式）。
 
-## 一、核心思路
+你可以直接替换当前两个文件，然后在项目里安装 `xlsx` 依赖即可：
 
-1. 把同一天的所有时间片拆成两类：
-
-   * **可用**：`normal / overtime / continuous`
-   * **不可用**：`leave / fault / maintenance`
-2. 每个时间片转成一个「分钟区间」：
-
-   * `startMin = startDay * 1440 + HH*60 + MM`
-   * `endMin   = endDay * 1440 + HH*60 + MM`
-3. 分别对可用区间、不可用区间做一次“合并重叠区间”（union）。
-4. 用「可用区间合集」减去「不可用区间合集」，得到真正的有效区间。
-5. 有效区间的总分钟数就是 **有效可用时长**，把这些区间再转回 `(startDay, start, endDay, end)` 就能用你现有的 `formatTimeRange` 渲染「有效时间段」。
-
-这样，无论不可用时间片怎么穿插、重叠，都会优先把对应时间抹掉，完全符合「不可用优先级高」的要求。
+```bash
+npm install xlsx
+# 或
+yarn add xlsx
+```
 
 ---
 
-## 二、实现一个 `computeEffectiveInfo`（考虑不可用时间片）
-
-在 `App.tsx` 里，`isSliceAvailable` 和 `computeEffectiveRanges` 附近加 / 改如下逻辑：
-
-### 1. 小工具：时间片转分钟区间 + 合并区间工具
+## App.tsx（完整）
 
 ```tsx
+import { useMemo, useRef, useState } from 'react';
+import * as XLSX from 'xlsx';
+
+type ViewMode = 'shift' | 'effective';
+type SliceType =
+  | 'normal'
+  | 'overtime'
+  | 'continuous'
+  | 'leave'
+  | 'fault'
+  | 'maintenance';
+type DayFlag = 0 | 1;
+
+interface TimeSlice {
+  id: string;
+  name: string;      // “白班8h”、“加班2h”等
+  type: SliceType;
+  start: string;     // HH:MM
+  end: string;       // HH:MM
+  startDay: DayFlag; // 0=今日, 1=次日
+  endDay: DayFlag;
+  isTemplate: boolean;
+}
+
+interface ScheduleDetail {
+  slices: TimeSlice[];
+}
+
+type ResourceType = 'line' | 'person' | 'equipment' | 'mold';
+
+interface ResourceRow {
+  id: string;
+  name: string;
+  code: string;
+  resourceType: ResourceType;
+  templateName: string;
+  templateDesc: string;
+  details: Record<string, ScheduleDetail>; // key: date YYYY-MM-DD
+}
+
+interface TemplateSliceDef {
+  start: string;
+  end: string;
+  startDay: DayFlag;
+  endDay: DayFlag;
+}
+
+interface TemplateDef {
+  name: string;
+  desc: string;
+  slices: TemplateSliceDef[];
+}
+
+/** 日期工具函数 **/
+const parseDate = (s: string) => {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y, m - 1, d);
+};
+
+const pad2 = (n: number) => (n < 10 ? `0${n}` : `${n}`);
+
+const formatDate = (d: Date) => {
+  const y = d.getFullYear();
+  const m = pad2(d.getMonth() + 1);
+  const day = pad2(d.getDate());
+  return `${y}-${m}-${day}`;
+};
+
+const addDays = (dateStr: string, days: number) => {
+  const base = parseDate(dateStr);
+  base.setDate(base.getDate() + days);
+  return formatDate(base);
+};
+
+const generateDates = (start: string, count: number): string[] => {
+  const result: string[] = [];
+  let d = parseDate(start);
+  for (let i = 0; i < count; i++) {
+    result.push(formatDate(d));
+    d.setDate(d.getDate() + 1);
+  }
+  return result;
+};
+
+/** 模板定义 **/
+const TEMPLATE_DEFS: Record<string, TemplateDef> = {
+  '白班8h': {
+    name: '白班8h',
+    desc: '08:00-12:00, 13:00-17:00',
+    slices: [
+      { start: '08:00', end: '12:00', startDay: 0, endDay: 0 },
+      { start: '13:00', end: '17:00', startDay: 0, endDay: 0 },
+    ],
+  },
+  '夜班8h': {
+    name: '夜班8h',
+    desc: '20:00-24:00, 00:00-04:00',
+    slices: [
+      // 20:00 ~ 次日 00:00
+      { start: '20:00', end: '00:00', startDay: 0, endDay: 1 },
+      // 次日 00:00 ~ 04:00
+      { start: '00:00', end: '04:00', startDay: 1, endDay: 1 },
+    ],
+  },
+  '白班12h': {
+    name: '白班12h',
+    desc: '08:00-20:00',
+    slices: [{ start: '08:00', end: '20:00', startDay: 0, endDay: 0 }],
+  },
+  '两班倒': {
+    name: '两班倒',
+    desc: '06:00-14:00, 14:00-22:00',
+    slices: [
+      { start: '06:00', end: '14:00', startDay: 0, endDay: 0 },
+      { start: '14:00', end: '22:00', startDay: 0, endDay: 0 },
+    ],
+  },
+};
+
+// 从 2025-12-01 起 45 天
+const DATES = generateDates('2025-12-01', 45);
+// 演示用“今天”
+const TODAY = DATES[0];
+// 12 月 1–7 这一周
+const WEEK_DATES = DATES.slice(0, 7);
+
+const genId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+const createTemplateSlices = (templateName: string): TimeSlice[] => {
+  const def = TEMPLATE_DEFS[templateName];
+  if (!def) return [];
+  return def.slices.map(s => ({
+    id: genId(),
+    name: '',
+    type: 'normal',
+    start: s.start,
+    end: s.end,
+    startDay: s.startDay,
+    endDay: s.endDay,
+    isTemplate: true,
+  }));
+};
+
+const slice = (
+  name: string,
+  type: SliceType,
+  start: string,
+  end: string,
+  startDay: DayFlag,
+  endDay: DayFlag,
+  isTemplate = true,
+): TimeSlice => ({
+  id: genId(),
+  name,
+  type,
+  start,
+  end,
+  startDay,
+  endDay,
+  isTemplate,
+});
+
+/** 基础示例数据（只填特殊情况） **/
+const BASE_ROWS: ResourceRow[] = [
+  {
+    id: 'lineA',
+    name: '产线 A',
+    code: 'LineA',
+    resourceType: 'line',
+    templateName: '白班8h',
+    templateDesc: TEMPLATE_DEFS['白班8h'].desc,
+    details: {
+      // 12-01: 模板 + 加班
+      '2025-12-01': {
+        slices: [
+          ...createTemplateSlices('白班8h'),
+          slice('加班4h', 'overtime', '19:00', '23:00', 0, 0, false),
+        ],
+      },
+      // 12-03: 模板 + 直落
+      '2025-12-03': {
+        slices: [
+          ...createTemplateSlices('白班8h'),
+          slice('直落2h', 'continuous', '17:00', '19:00', 0, 0, false),
+        ],
+      },
+      // 12-05: 整天休息
+      '2025-12-05': {
+        slices: [slice('休息24h', 'leave', '00:00', '00:00', 0, 1, false)],
+      },
+    },
+  },
+  {
+    id: 'lineB',
+    name: '产线 B',
+    code: 'LineB',
+    resourceType: 'line',
+    templateName: '夜班8h',
+    templateDesc: TEMPLATE_DEFS['夜班8h'].desc,
+    details: {
+      '2025-12-01': {
+        slices: [...createTemplateSlices('夜班8h')],
+      },
+      '2025-12-02': {
+        slices: [
+          ...createTemplateSlices('夜班8h'),
+          slice('加班4h', 'overtime', '18:00', '22:00', 0, 0, false),
+        ],
+      },
+      '2025-12-04': {
+        slices: [...createTemplateSlices('夜班8h')],
+      },
+    },
+  },
+  {
+    id: 'lineC',
+    name: '产线 C',
+    code: 'LineC',
+    resourceType: 'line',
+    templateName: '两班倒',
+    templateDesc: TEMPLATE_DEFS['两班倒'].desc,
+    details: {
+      '2025-12-01': {
+        slices: [
+          slice('早班8h', 'normal', '06:00', '14:00', 0, 0, true),
+          slice('中班8h', 'normal', '14:00', '22:00', 0, 0, true),
+        ],
+      },
+      '2025-12-06': {
+        slices: [
+          ...createTemplateSlices('两班倒'),
+          slice('故障2h', 'fault', '10:00', '12:00', 0, 0, false),
+        ],
+      },
+    },
+  },
+  {
+    id: 'worker1',
+    name: '员工 张三',
+    code: 'Worker001',
+    resourceType: 'person',
+    templateName: '白班8h',
+    templateDesc: '08:00-17:00',
+    details: {
+      '2025-12-01': {
+        slices: [
+          slice('上班4h', 'normal', '08:00', '12:00', 0, 0, true),
+          slice('午休1h', 'leave', '12:00', '13:00', 0, 0, false),
+          slice('上班4h', 'normal', '13:00', '17:00', 0, 0, true),
+        ],
+      },
+      '2025-12-03': {
+        slices: [slice('请假8h', 'leave', '08:00', '16:00', 0, 0, false)],
+      },
+    },
+  },
+  {
+    id: 'worker2',
+    name: '员工 李四',
+    code: 'Worker002',
+    resourceType: 'person',
+    templateName: '夜班8h',
+    templateDesc: '20:00-04:00',
+    details: {
+      '2025-12-01': {
+        slices: [...createTemplateSlices('夜班8h')],
+      },
+      '2025-12-07': {
+        slices: [
+          ...createTemplateSlices('夜班8h'),
+          slice('直落2h', 'continuous', '04:00', '06:00', 1, 1, false),
+        ],
+      },
+    },
+  },
+  {
+    id: 'equip1',
+    name: '设备 1 号机',
+    code: 'Equip001',
+    resourceType: 'equipment',
+    templateName: '白班12h',
+    templateDesc: TEMPLATE_DEFS['白班12h'].desc,
+    details: {
+      '2025-12-01': {
+        slices: [...createTemplateSlices('白班12h')],
+      },
+      '2025-12-02': {
+        slices: [slice('保养8h', 'maintenance', '08:00', '16:00', 0, 0, false)],
+      },
+    },
+  },
+  {
+    id: 'moldX',
+    name: '模具 X',
+    code: 'MoldX',
+    resourceType: 'mold',
+    templateName: '白班12h',
+    templateDesc: TEMPLATE_DEFS['白班12h'].desc,
+    details: {
+      '2025-12-01': {
+        slices: [...createTemplateSlices('白班12h')],
+      },
+      '2025-12-04': {
+        slices: [
+          ...createTemplateSlices('白班12h'),
+          slice('保养4h', 'maintenance', '16:00', '20:00', 0, 0, false),
+        ],
+      },
+    },
+  },
+];
+
+/** 补齐 12 月 1–7 默认排班 **/
+const fillWeekDefaults = (row: ResourceRow): ResourceRow => {
+  const filled: Record<string, ScheduleDetail> = { ...row.details };
+  WEEK_DATES.forEach(date => {
+    if (!filled[date]) {
+      filled[date] = { slices: createTemplateSlices(row.templateName) };
+    }
+  });
+  return { ...row, details: filled };
+};
+
+const INITIAL_ROWS: ResourceRow[] = BASE_ROWS.map(fillWeekDefaults);
+
+const sliceTypeLabel: Record<SliceType, string> = {
+  normal: '常规',
+  overtime: '加班',
+  continuous: '直落',
+  leave: '请假',
+  fault: '故障',
+  maintenance: '保养',
+};
+
+const isSliceAvailable = (type: SliceType) =>
+  type === 'normal' || type === 'overtime' || type === 'continuous';
+
+const formatTimeRange = (
+  startDay: DayFlag,
+  start: string,
+  endDay: DayFlag,
+  end: string,
+) => {
+  const startLabel = start;
+  const endLabel = startDay === 0 && endDay === 1 ? `次日 ${end}` : end;
+  return `${startLabel} ~ ${endLabel}`;
+};
+
+const chipClassForSlice = (templateName: string, slice: TimeSlice): string => {
+  if (
+    slice.type === 'leave' ||
+    slice.type === 'fault' ||
+    slice.type === 'maintenance'
+  ) {
+    return 'chip chip-muted';
+  }
+  // 常规 / 加班 / 直落 使用模板色
+  if (templateName.includes('白班8h') || templateName.includes('白班12h')) {
+    return 'chip chip-template-day';
+  }
+  if (templateName.includes('夜班8h')) return 'chip chip-template-night';
+  if (templateName.includes('两班倒')) return 'chip chip-template-two';
+  return 'chip';
+};
+
+/** —— 有效时间段 + 有效可用时长计算（考虑不可用时间片） —— **/
+
 const toMinutes = (time: string) => {
   const h = parseInt(time.slice(0, 2), 10);
   const m = parseInt(time.slice(3, 5), 10);
@@ -43,7 +400,6 @@ interface MinuteRange {
 const sliceToRange = (s: TimeSlice): MinuteRange | null => {
   const start = s.startDay * 24 * 60 + toMinutes(s.start);
   const end = s.endDay * 24 * 60 + toMinutes(s.end);
-  // 防御一下无效时间片
   if (end <= start) return null;
   return { start, end };
 };
@@ -63,11 +419,7 @@ const mergeRanges = (ranges: MinuteRange[]): MinuteRange[] => {
   }
   return res;
 };
-```
 
-### 2. 计算“有效区间 + 总分钟数”
-
-```tsx
 interface EffectiveInfo {
   ranges: {
     startDay: DayFlag;
@@ -78,6 +430,7 @@ interface EffectiveInfo {
   totalMinutes: number;
 }
 
+// 可用区间 union，再用不可用区间 union 扣减
 const computeEffectiveInfo = (detail: ScheduleDetail): EffectiveInfo => {
   const availableRanges: MinuteRange[] = [];
   const blockedRanges: MinuteRange[] = [];
@@ -88,7 +441,6 @@ const computeEffectiveInfo = (detail: ScheduleDetail): EffectiveInfo => {
     if (isSliceAvailable(s.type)) {
       availableRanges.push(range);
     } else {
-      // 请假 / 故障 / 保养 等都视为不可用
       blockedRanges.push(range);
     }
   });
@@ -100,14 +452,12 @@ const computeEffectiveInfo = (detail: ScheduleDetail): EffectiveInfo => {
     return { ranges: [], totalMinutes: 0 };
   }
 
-  // 用不可用区间从可用区间里“扣除”
   const resultRanges: MinuteRange[] = [];
   let j = 0;
 
   for (const a of availUnion) {
     let curStart = a.start;
 
-    // 跳过完全在当前可用区间左边的不可用区间
     while (j < blockUnion.length && blockUnion[j].end <= curStart) {
       j++;
     }
@@ -116,7 +466,6 @@ const computeEffectiveInfo = (detail: ScheduleDetail): EffectiveInfo => {
     while (k < blockUnion.length && blockUnion[k].start < a.end) {
       const b = blockUnion[k];
 
-      // 有一段 [curStart, b.start) 仍然有效
       if (b.start > curStart) {
         resultRanges.push({
           start: curStart,
@@ -124,18 +473,15 @@ const computeEffectiveInfo = (detail: ScheduleDetail): EffectiveInfo => {
         });
       }
 
-      // 如果不可用区间已经覆盖到 a.end 甚至更远，这个可用区间后面就没了
       if (b.end >= a.end) {
         curStart = a.end;
         break;
       }
 
-      // 不可用区间在中间，向后推进 curStart，继续找下一个不可用区间
       curStart = Math.max(curStart, b.end);
       k++;
     }
 
-    // 循环结束后，还有一截尾巴没被覆盖
     if (curStart < a.end) {
       resultRanges.push({ start: curStart, end: a.end });
     }
@@ -146,7 +492,6 @@ const computeEffectiveInfo = (detail: ScheduleDetail): EffectiveInfo => {
     0,
   );
 
-  // 把分钟数区间还原为 (DayFlag + HH:mm)
   const ranges = resultRanges.map(r => {
     const startDay: DayFlag = (r.start >= 24 * 60 ? 1 : 0) as DayFlag;
     const startOffset = r.start - startDay * 24 * 60;
@@ -168,110 +513,2577 @@ const computeEffectiveInfo = (detail: ScheduleDetail): EffectiveInfo => {
 
   return { ranges, totalMinutes };
 };
-```
 
-> 这里仍然兼容你原有的 “次日 00:00” 表达方式：
-> 当 `r.end === 1440` 分钟时，会得到 `endDay=1, end='00:00'`，`formatTimeRange` 会显示成「次日 00:00」。
-
----
-
-## 三、兼容原来的 `computeEffectiveRanges`（列表视图用）
-
-你当前在「有效时间视图」里用的是 `computeEffectiveRanges(detail)` 返回 `{label}` 数组。
-我们可以用刚才的 `computeEffectiveInfo` 来改造它：
-
-```tsx
-const computeEffectiveRanges = (
-  detail: ScheduleDetail,
-): { label: string }[] => {
+// 供“有效时间视图”使用
+const computeEffectiveRanges = (detail: ScheduleDetail): { label: string }[] => {
   const info = computeEffectiveInfo(detail);
   if (info.ranges.length === 0) return [{ label: '无' }];
   return info.ranges.map(r => ({
     label: formatTimeRange(r.startDay, r.start, r.endDay, r.end),
   }));
 };
-```
 
-这样，表格里的「有效时间视图」也会自动考虑不可用时间片，展示的时间段就是**扣掉请假/故障/保养之后的真实有效段**。
+/** —— 资源类型的中文映射（导入导出） —— **/
+const resourceTypeLabel: Record<ResourceType, string> = {
+  line: '产线',
+  person: '人员',
+  equipment: '设备',
+  mold: '模具',
+};
 
----
+const resourceTypeFromLabel = (label: string): ResourceType | null => {
+  const entry = Object.entries(resourceTypeLabel).find(
+    ([, v]) => v === label,
+  );
+  return entry ? (entry[0] as ResourceType) : null;
+};
 
-## 四、排班详情抽屉里：同时显示「有效时间段」+「有效可用时长」
+const sliceTypeFromLabel = (label: string): SliceType | null => {
+  const entry = Object.entries(sliceTypeLabel).find(
+    ([, v]) => v === label,
+  );
+  return entry ? (entry[0] as SliceType) : null;
+};
 
-原来你有一个 `effectiveLabelInDetail`：
+const dayFlagFromLabel = (label: string): DayFlag =>
+  label === '次日' ? 1 : 0;
 
-```tsx
-const effectiveLabelInDetail = useMemo(() => {
-  if (!editingDetail) return '';
-  const ranges = computeEffectiveRanges({
-    slices: editingDetail.slices,
+const labelFromDayFlag = (flag: DayFlag): string =>
+  flag === 0 ? '今日' : '次日';
+
+const isTemplateFromLabel = (label?: string): boolean =>
+  label === '是';
+
+const labelFromIsTemplate = (val: boolean): string =>
+  val ? '是' : '否';
+
+/** —— Excel 导入辅助纯函数 —— **/
+
+// 导入：根据“资源与计划”sheet 更新每个资源的默认模板
+const applyImportPlans = (
+  rows: ResourceRow[],
+  sheetRows: any[],
+): ResourceRow[] => {
+  if (!sheetRows || sheetRows.length === 0) return rows;
+
+  const templateNames = Object.keys(TEMPLATE_DEFS);
+  const planMap = new Map<
+    string,
+    {
+      code: string;
+      name?: string;
+      resourceTypeLabel?: string;
+      templateName: string;
+    }
+  >();
+
+  sheetRows.forEach(r => {
+    const code = (r['资源编码'] || '').toString().trim();
+    if (!code) return;
+
+    const templateName = (r['默认排班模板'] || '').toString().trim();
+    if (!templateNames.includes(templateName)) return;
+
+    planMap.set(code, {
+      code,
+      name: r['资源名称'],
+      resourceTypeLabel: r['资源类型'],
+      templateName,
+    });
   });
-  return ranges.map(r => r.label).join(' + ');
-}, [editingDetail]);
-```
 
-现在我们想把 **时间段 + 时长** 一起算出来，可以改成这样：
-
-```tsx
-const effectiveInfoInDetail = useMemo(() => {
-  if (!editingDetail) {
-    return { label: '', hours: 0 };
-  }
-  const info = computeEffectiveInfo({
-    slices: editingDetail.slices,
+  return rows.map(row => {
+    const plan = planMap.get(row.code);
+    if (!plan) return row;
+    const def = TEMPLATE_DEFS[plan.templateName];
+    const rt =
+      plan.resourceTypeLabel &&
+      resourceTypeFromLabel(String(plan.resourceTypeLabel));
+    return {
+      ...row,
+      name: plan.name ? String(plan.name) : row.name,
+      resourceType: rt ?? row.resourceType,
+      templateName: plan.templateName,
+      templateDesc: def ? def.desc : row.templateDesc,
+    };
   });
-  const label = info.ranges.length
-    ? info.ranges
-        .map(r => formatTimeRange(r.startDay, r.start, r.endDay, r.end))
-        .join(' + ')
-    : '';
-  return {
-    label,
-    hours: info.totalMinutes / 60,
+};
+
+// group (资源编码 + 日期) -> 明细行数组
+const groupDetailRows = (sheetRows: any[]) => {
+  const map = new Map<string, any[]>();
+  sheetRows.forEach(r => {
+    const code = (r['资源编码'] || '').toString().trim();
+    const date = (r['日期'] || '').toString().trim();
+    if (!code || !date) return;
+    const key = `${code}__${date}`;
+    const list = map.get(key) || [];
+    list.push(r);
+    map.set(key, list);
+  });
+  return map;
+};
+
+// 导入：根据“排班详情”sheet 覆盖对应资源+日期的时间片
+const applyImportDetails = (
+  rows: ResourceRow[],
+  sheetRows: any[],
+): ResourceRow[] => {
+  if (!sheetRows || sheetRows.length === 0) return rows;
+
+  const grouped = groupDetailRows(sheetRows);
+
+  return rows.map(row => {
+    const newDetails: Record<string, ScheduleDetail> = { ...row.details };
+
+    grouped.forEach((detailRows, key) => {
+      const [code, date] = key.split('__');
+      if (code !== row.code) return;
+
+      const slices: TimeSlice[] = [];
+
+      detailRows.forEach(r => {
+        const typeLabel = (r['时间片类型'] || '').toString().trim();
+        const type = sliceTypeFromLabel(typeLabel);
+        if (!type) return;
+
+        const startDayLabel = (r['开始日标记'] || '今日').toString().trim();
+        const endDayLabel = (r['结束日标记'] || '今日').toString().trim();
+        const startDay = dayFlagFromLabel(startDayLabel);
+        const endDay = dayFlagFromLabel(endDayLabel);
+
+        const start = (r['开始时间'] || '').toString().slice(0, 5);
+        const end = (r['结束时间'] || '').toString().slice(0, 5);
+        if (!start || !end) return;
+
+        const name = (r['时间片名称'] || '').toString();
+        const isTemplate = isTemplateFromLabel(
+          (r['是否模板时间片'] || '').toString().trim(),
+        );
+
+        slices.push({
+          id: genId(),
+          name,
+          type,
+          start,
+          end,
+          startDay,
+          endDay,
+          isTemplate,
+        });
+      });
+
+      if (slices.length > 0) {
+        newDetails[date] = { slices };
+      }
+    });
+
+    return { ...row, details: newDetails };
+  });
+};
+
+interface EditingDetailState {
+  resourceId: string;
+  date: string;
+  templateName: string;
+  slices: TimeSlice[];
+  isNew: boolean;
+}
+
+type RollMode = 'onlyEmpty' | 'replaceTemplate' | 'replaceAll';
+
+function App() {
+  const [rows, setRows] = useState<ResourceRow[]>(INITIAL_ROWS);
+  const [viewMode, setViewMode] = useState<ViewMode>('shift');
+
+  const [selectedRows, setSelectedRows] = useState<string[]>([]);
+  const [selectedCols, setSelectedCols] = useState<string[]>([]);
+
+  const [editingDetail, setEditingDetail] = useState<EditingDetailState | null>(
+    null,
+  );
+  const [planContext, setPlanContext] = useState<string | null>(null); // resourceId
+  const [planTemplateName, setPlanTemplateName] = useState<string>('白班8h');
+
+  const [rollContext, setRollContext] = useState<string | null>(null); // resourceId
+  const [rollConfig, setRollConfig] = useState<{
+    start: string;
+    end: string;
+    mode: RollMode;
+  }>({
+    start: DATES[0],
+    end: DATES[DATES.length - 1],
+    mode: 'onlyEmpty',
+  });
+
+  const [bulkPlanOpen, setBulkPlanOpen] = useState(false);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [resourceFilter, setResourceFilter] = useState('');
+
+  // 批量添加时间片弹框
+  const [bulkSliceOpen, setBulkSliceOpen] = useState(false);
+  const [bulkSliceConfig, setBulkSliceConfig] = useState<{
+    resourceIds: string[];
+    startDate: string;
+    startTime: string;
+    endDate: string;
+    endTime: string;
+    type: SliceType;
+    name: string;
+  }>({
+    resourceIds: [],
+    startDate: DATES[0],
+    startTime: '08:00',
+    endDate: DATES[0],
+    endTime: '17:00',
+    type: 'overtime',
+    name: '',
+  });
+
+  // 日期区间（受控）
+  const [dateStart, setDateStart] = useState<string>(DATES[0]);
+  const [dateEnd, setDateEnd] = useState<string>(DATES[DATES.length - 1]);
+
+  // 导入文件 input
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const visibleDates = useMemo(
+    () => DATES.filter(d => d >= dateStart && d <= dateEnd),
+    [dateStart, dateEnd],
+  );
+
+  const filteredRows = useMemo(() => {
+    const kw = resourceFilter.trim().toLowerCase();
+    if (!kw) return rows;
+    return rows.filter(
+      r =>
+        r.name.toLowerCase().includes(kw) ||
+        r.code.toLowerCase().includes(kw),
+    );
+  }, [rows, resourceFilter]);
+
+  const hasRowSelection = selectedRows.length > 0;
+  const allRowsSelected =
+    selectedRows.length === rows.length && rows.length > 0;
+  const allColsSelected =
+    visibleDates.length > 0 &&
+    visibleDates.every(d => selectedCols.includes(d));
+
+  const toggleRow = (id: string) => {
+    setSelectedRows(prev =>
+      prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id],
+    );
   };
-}, [editingDetail]);
+
+  const toggleCol = (date: string) => {
+    setSelectedCols(prev =>
+      prev.includes(date) ? prev.filter(x => x !== date) : [...prev, date],
+    );
+  };
+
+  const selectAllRows = (checked: boolean) => {
+    if (checked) {
+      setSelectedRows(rows.map(r => r.id));
+    } else {
+      setSelectedRows([]);
+    }
+  };
+
+  const selectAllCols = (checked: boolean) => {
+    if (checked) {
+      setSelectedCols(prev => Array.from(new Set([...prev, ...visibleDates])));
+    } else {
+      setSelectedCols(prev =>
+        prev.filter(d => !visibleDates.includes(d)),
+      );
+    }
+  };
+
+  const clearSelection = () => {
+    setSelectedRows([]);
+    setSelectedCols([]);
+  };
+
+  const bulkPlanTargets = useMemo(
+    () =>
+      rows
+        .filter(r => selectedRows.includes(r.id))
+        .map(r => r.name)
+        .join('、'),
+    [rows, selectedRows],
+  );
+
+  const bulkDeleteSummary = useMemo(() => {
+    const rowNames =
+      rows
+        .filter(r => selectedRows.includes(r.id))
+        .map(r => r.name)
+        .join('、') || '（无资源）';
+    const colLabels = selectedCols.join('、');
+    if (!rowNames.trim()) return '当前没有选中任何资源。';
+    if (colLabels) {
+      return `将清空以下资源在以下日期的排班详情：\n资源：${rowNames}\n日期：${colLabels}`;
+    }
+    return `将清空以下资源在当前表格所有日期列的排班详情：\n资源：${rowNames}`;
+  }, [rows, selectedRows, selectedCols]);
+
+  const getRowById = (id: string | null) =>
+    rows.find(r => r.id === id);
+
+  const openDetail = (resourceId: string, date: string) => {
+    const row = rows.find(r => r.id === resourceId);
+    if (!row) return;
+    const detail = row.details[date];
+    if (detail) {
+      setEditingDetail({
+        resourceId,
+        date,
+        templateName: row.templateName || '',
+        slices: detail.slices.map(s => ({ ...s })),
+        isNew: false,
+      });
+    } else {
+      setEditingDetail({
+        resourceId,
+        date,
+        templateName: '',
+        slices: [],
+        isNew: true,
+      });
+    }
+  };
+
+  const closeDetail = () => setEditingDetail(null);
+
+  const openPlan = (resourceId: string) => {
+    const row = rows.find(r => r.id === resourceId);
+    setPlanContext(resourceId);
+    setPlanTemplateName(row?.templateName || '白班8h');
+  };
+  const closePlan = () => setPlanContext(null);
+
+  const openRoll = (resourceId: string) => {
+    setRollContext(resourceId);
+    setRollConfig({
+      start: dateStart,
+      end: dateEnd,
+      mode: 'onlyEmpty',
+    });
+  };
+  const closeRoll = () => setRollContext(null);
+
+  const openBulkPlan = () => setBulkPlanOpen(true);
+  const closeBulkPlan = () => setBulkPlanOpen(false);
+
+  const openBulkDelete = () => setBulkDeleteOpen(true);
+  const closeBulkDelete = () => setBulkDeleteOpen(false);
+
+  // 批量添加时间片：不用要求预先选中资源，直接点即可
+  const openBulkSlice = () => {
+    setBulkSliceConfig(cfg => ({
+      ...cfg,
+      resourceIds: selectedRows.length ? [...selectedRows] : [],
+      startDate: dateStart,
+      endDate: dateStart,
+    }));
+    setBulkSliceOpen(true);
+  };
+  const closeBulkSlice = () => setBulkSliceOpen(false);
+
+  const closeAllLayers = () => {
+    setEditingDetail(null);
+    setPlanContext(null);
+    setRollContext(null);
+    setBulkPlanOpen(false);
+    setBulkDeleteOpen(false);
+    setBulkSliceOpen(false);
+  };
+
+  const anyLayerOpen = !!(
+    editingDetail ||
+    planContext ||
+    rollContext ||
+    bulkPlanOpen ||
+    bulkDeleteOpen ||
+    bulkSliceOpen
+  );
+
+  const saveEditingDetail = () => {
+    if (!editingDetail) return;
+    setRows(prev =>
+      prev.map(r => {
+        if (r.id !== editingDetail.resourceId) return r;
+        const newDetails = { ...r.details };
+        if (editingDetail.slices.length === 0) {
+          delete newDetails[editingDetail.date];
+        } else {
+          newDetails[editingDetail.date] = {
+            slices: editingDetail.slices,
+          };
+        }
+        return { ...r, details: newDetails };
+      }),
+    );
+    setEditingDetail(null);
+  };
+
+  const updateSlice = (id: string, partial: Partial<TimeSlice>) => {
+    if (!editingDetail) return;
+    setEditingDetail({
+      ...editingDetail,
+      slices: editingDetail.slices.map(s =>
+        s.id === id ? { ...s, ...partial, isTemplate: false } : s,
+      ),
+    });
+  };
+
+  const addSlice = () => {
+    if (!editingDetail) return;
+    const newSlice: TimeSlice = {
+      id: genId(),
+      name: '',
+      type: 'normal',
+      start: '08:00',
+      end: '12:00',
+      startDay: 0,
+      endDay: 0,
+      isTemplate: false,
+    };
+    setEditingDetail({
+      ...editingDetail,
+      slices: [...editingDetail.slices, newSlice],
+    });
+  };
+
+  const removeSlice = (id: string) => {
+    if (!editingDetail) return;
+    setEditingDetail({
+      ...editingDetail,
+      slices: editingDetail.slices.filter(s => s.id !== id),
+    });
+  };
+
+  const changeDetailTemplate = (templateName: string) => {
+    if (!editingDetail) return;
+    if (!templateName) {
+      // 不使用模板，仅清空“模板标记”
+      setEditingDetail({
+        ...editingDetail,
+        templateName: '',
+        slices: editingDetail.slices.map(s => ({
+          ...s,
+          isTemplate: false,
+        })),
+      });
+      return;
+    }
+    const tmplSlices = createTemplateSlices(templateName);
+    setEditingDetail({
+      ...editingDetail,
+      templateName,
+      slices: tmplSlices,
+    });
+  };
+
+  const savePlanTemplate = () => {
+    if (!planContext) return;
+    const def = TEMPLATE_DEFS[planTemplateName];
+    setRows(prev =>
+      prev.map(r =>
+        r.id === planContext
+          ? {
+              ...r,
+              templateName: planTemplateName,
+              templateDesc: def ? def.desc : r.templateDesc,
+            }
+          : r,
+      ),
+    );
+    setPlanContext(null);
+  };
+
+  // 详情抽屉中：有效时间段 + 有效可用时长
+  const effectiveInfoInDetail = useMemo(() => {
+    if (!editingDetail) {
+      return { label: '', hours: 0 };
+    }
+    const info = computeEffectiveInfo({
+      slices: editingDetail.slices,
+    });
+    const label = info.ranges.length
+      ? info.ranges
+          .map(r => formatTimeRange(r.startDay, r.start, r.endDay, r.end))
+          .join(' + ')
+      : '';
+    return {
+      label,
+      hours: info.totalMinutes / 60,
+    };
+  }, [editingDetail]);
+
+  const executeRoll = () => {
+    if (!rollContext) return;
+    const row = rows.find(r => r.id === rollContext);
+    if (!row) return;
+    const tmplDef = TEMPLATE_DEFS[row.templateName];
+    if (!tmplDef) {
+      setRollContext(null);
+      return;
+    }
+
+    setRows(prev =>
+      prev.map(r => {
+        if (r.id !== rollContext) return r;
+        const baseDetails: Record<string, ScheduleDetail> = {
+          ...r.details,
+        };
+        const start = rollConfig.start;
+        const end = rollConfig.end;
+
+        DATES.forEach(date => {
+          if (date < start || date > end) return;
+          const existing = baseDetails[date];
+
+          const templateSlices = tmplDef.slices.map(s => ({
+            id: genId(),
+            name: '',
+            type: 'normal' as SliceType,
+            start: s.start,
+            end: s.end,
+            startDay: s.startDay,
+            endDay: s.endDay,
+            isTemplate: true,
+          }));
+
+          if (rollConfig.mode === 'onlyEmpty') {
+            if (existing && existing.slices.length > 0) return;
+            baseDetails[date] = {
+              slices: templateSlices,
+            };
+          } else if (rollConfig.mode === 'replaceTemplate') {
+            const prevDetail = existing || { slices: [] };
+            const nonTemplateSlices = prevDetail.slices.filter(
+              s => !s.isTemplate,
+            );
+            baseDetails[date] = {
+              slices: [...nonTemplateSlices, ...templateSlices],
+            };
+          } else {
+            baseDetails[date] = {
+              slices: templateSlices,
+            };
+          }
+        });
+
+        return { ...r, details: baseDetails };
+      }),
+    );
+
+    setRollContext(null);
+  };
+
+  // 批量添加时间片：按日期拆分时间范围，尽量不生成跨天时间片
+  const executeBulkAddSlices = () => {
+    const {
+      resourceIds,
+      startDate,
+      startTime,
+      endDate,
+      endTime,
+      type,
+      name,
+    } = bulkSliceConfig;
+
+    if (!resourceIds.length) {
+      setBulkSliceOpen(false);
+      return;
+    }
+
+    const startDateObj = parseDate(startDate);
+    const endDateObj = parseDate(endDate);
+
+    const [sh, sm] = startTime.split(':').map(Number);
+    const [eh, em] = endTime.split(':').map(Number);
+
+    const globalStart = new Date(
+      startDateObj.getFullYear(),
+      startDateObj.getMonth(),
+      startDateObj.getDate(),
+      sh,
+      sm,
+      0,
+      0,
+    );
+    const globalEnd = new Date(
+      endDateObj.getFullYear(),
+      endDateObj.getMonth(),
+      endDateObj.getDate(),
+      eh,
+      em,
+      0,
+      0,
+    );
+
+    if (globalEnd <= globalStart) {
+      setBulkSliceOpen(false);
+      return;
+    }
+
+    const dayList: string[] = [];
+    {
+      const d = new Date(
+        globalStart.getFullYear(),
+        globalStart.getMonth(),
+        globalStart.getDate(),
+      );
+      while (d <= globalEnd) {
+        dayList.push(formatDate(d));
+        d.setDate(d.getDate() + 1);
+      }
+    }
+
+    setRows(prev =>
+      prev.map(r => {
+        if (!resourceIds.includes(r.id)) return r;
+
+        const newDetails: Record<string, ScheduleDetail> = {
+          ...r.details,
+        };
+
+        dayList.forEach(dateStr => {
+          const dayStart = parseDate(dateStr);
+          dayStart.setHours(0, 0, 0, 0);
+          const nextDay = new Date(dayStart);
+          nextDay.setDate(nextDay.getDate() + 1);
+
+          const segStart =
+            globalStart > dayStart ? globalStart : dayStart;
+          const segEnd = globalEnd < nextDay ? globalEnd : nextDay;
+
+          if (segEnd <= segStart) return;
+
+          const stH = segStart.getHours();
+          const stM = segStart.getMinutes();
+          const enH = segEnd.getHours();
+          const enM = segEnd.getMinutes();
+
+          let startDay: DayFlag = 0;
+          let endDay: DayFlag = 0;
+          const startStr = `${pad2(stH)}:${pad2(stM)}`;
+          let endStr = `${pad2(enH)}:${pad2(enM)}`;
+
+          // 刚好到次日 00:00，用 endDay=1, end=00:00 表示
+          if (segEnd.getTime() === nextDay.getTime()) {
+            endDay = 1;
+            endStr = '00:00';
+          }
+
+          const sliceToAdd: TimeSlice = {
+            id: genId(),
+            name: name.trim(),
+            type,
+            start: startStr,
+            end: endStr,
+            startDay,
+            endDay,
+            isTemplate: false,
+          };
+
+          const prevDetail = newDetails[dateStr] || { slices: [] };
+          newDetails[dateStr] = {
+            slices: [...prevDetail.slices, sliceToAdd],
+          };
+        });
+
+        return { ...r, details: newDetails };
+      }),
+    );
+
+    setBulkSliceOpen(false);
+  };
+
+  // 快捷筛选：今天 / 本周 / 本月 / 未来30天
+  const applyToday = () => {
+    setDateStart(TODAY);
+    setDateEnd(TODAY);
+  };
+
+  const applyThisWeek = () => {
+    setDateStart(TODAY);
+    setDateEnd(addDays(TODAY, 6));
+  };
+
+  const applyThisMonth = () => {
+    const d = parseDate(TODAY);
+    const monthStart = new Date(d.getFullYear(), d.getMonth(), 1);
+    const monthEnd = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+    setDateStart(formatDate(monthStart));
+    setDateEnd(formatDate(monthEnd));
+  };
+
+  const applyNext30Days = () => {
+    setDateStart(TODAY);
+    setDateEnd(addDays(TODAY, 30));
+  };
+
+  /** —— Excel 导出 —— **/
+  const handleExport = () => {
+    const wb = XLSX.utils.book_new();
+
+    // Sheet1：资源与计划
+    const sheet1Rows = rows.map(r => ({
+      资源编码: r.code,
+      资源名称: r.name,
+      资源类型: resourceTypeLabel[r.resourceType],
+      默认排班模板: r.templateName,
+      模板说明: r.templateDesc,
+    }));
+    const ws1 = XLSX.utils.json_to_sheet(sheet1Rows);
+    XLSX.utils.book_append_sheet(wb, ws1, '资源与计划');
+
+    // Sheet2：排班详情（仅导出当前筛选日期范围）
+    const sheet2Rows: any[] = [];
+    for (const r of rows) {
+      for (const date of visibleDates) {
+        const detail = r.details[date];
+        if (!detail) continue;
+        for (const s of detail.slices) {
+          sheet2Rows.push({
+            资源编码: r.code,
+            日期: date,
+            时间片名称: s.name,
+            时间片类型: sliceTypeLabel[s.type],
+            开始日标记: labelFromDayFlag(s.startDay),
+            开始时间: s.start,
+            结束日标记: labelFromDayFlag(s.endDay),
+            结束时间: s.end,
+            是否模板时间片: labelFromIsTemplate(s.isTemplate),
+          });
+        }
+      }
+    }
+    const ws2 = XLSX.utils.json_to_sheet(sheet2Rows);
+    XLSX.utils.book_append_sheet(wb, ws2, '排班详情');
+
+    // Sheet3：字典与说明（可选）
+    const dictRows: any[] = [
+      { 字典: '资源类型', 显示值: '产线', 系统值: 'line' },
+      { 字典: '资源类型', 显示值: '人员', 系统值: 'person' },
+      { 字典: '资源类型', 显示值: '设备', 系统值: 'equipment' },
+      { 字典: '资源类型', 显示值: '模具', 系统值: 'mold' },
+      { 字典: '时间片类型', 显示值: '常规', 系统值: 'normal' },
+      { 字典: '时间片类型', 显示值: '加班', 系统值: 'overtime' },
+      { 字典: '时间片类型', 显示值: '直落', 系统值: 'continuous' },
+      { 字典: '时间片类型', 显示值: '请假', 系统值: 'leave' },
+      { 字典: '时间片类型', 显示值: '故障', 系统值: 'fault' },
+      { 字典: '时间片类型', 显示值: '保养', 系统值: 'maintenance' },
+      { 字典: '日标记', 显示值: '今日', 系统值: 0 },
+      { 字典: '日标记', 显示值: '次日', 系统值: 1 },
+      { 字典: '是否模板时间片', 显示值: '是', 系统值: true },
+      { 字典: '是否模板时间片', 显示值: '否', 系统值: false },
+    ];
+    const ws3 = XLSX.utils.json_to_sheet(dictRows);
+    XLSX.utils.book_append_sheet(wb, ws3, '字典说明');
+
+    XLSX.writeFile(
+      wb,
+      `排班导出_${dateStart}_${dateEnd}.xlsx`,
+    );
+  };
+
+  /** —— Excel 导入 —— **/
+  const handleImportClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileChange: React.ChangeEventHandler<HTMLInputElement> = e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const data = ev.target?.result;
+      if (!data) return;
+      const wb = XLSX.read(data, { type: 'array' });
+
+      const wsPlan =
+        wb.Sheets['资源与计划'] ||
+        (wb.SheetNames[0] && wb.Sheets[wb.SheetNames[0]]);
+      const wsDetail =
+        wb.Sheets['排班详情'] ||
+        (wb.SheetNames[1] && wb.Sheets[wb.SheetNames[1]]);
+
+      if (!wsPlan && !wsDetail) {
+        alert('未找到有效的 Sheet（资源与计划 / 排班详情）');
+        return;
+      }
+
+      const planRows = wsPlan
+        ? XLSX.utils.sheet_to_json(wsPlan)
+        : [];
+      const detailRows = wsDetail
+        ? XLSX.utils.sheet_to_json(wsDetail)
+        : [];
+
+      setRows(prev => {
+        let next = applyImportPlans(prev, planRows);
+        next = applyImportDetails(next, detailRows);
+        return next;
+      });
+
+      alert('Excel 导入完成（按资源编码 + 日期覆盖对应排班）');
+    };
+
+    reader.readAsArrayBuffer(file);
+
+    // 清空 input 值，确保下次还能触发 onChange
+    e.target.value = '';
+  };
+
+  return (
+    <div className="page">
+      {/* 隐藏的文件选择框，用于导入 */}
+      <input
+        type="file"
+        accept=".xlsx,.xls"
+        ref={fileInputRef}
+        style={{ display: 'none' }}
+        onChange={handleFileChange}
+      />
+
+      <div className="page-header">
+        <div>
+          <div className="page-title">资源排班一览</div>
+          <div className="page-subtitle">
+            支持资源排班查看、编辑、滚动生成、批量操作与 Excel 导入导出
+          </div>
+        </div>
+        <div>
+          {hasRowSelection && (
+            <button className="button button-ghost" onClick={clearSelection}>
+              清空选中
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* 顶部筛选 + 视图 + 批量操作 */}
+      <div className="toolbar">
+        <div className="toolbar-left">
+          <span className="field-label">日期范围</span>
+          <input
+            className="input"
+            type="date"
+            value={dateStart}
+            onChange={e => setDateStart(e.target.value)}
+          />
+          <span>~</span>
+          <input
+            className="input"
+            type="date"
+            value={dateEnd}
+            onChange={e => setDateEnd(e.target.value)}
+          />
+
+          <button className="button button-soft" onClick={applyToday}>
+            今天
+          </button>
+          <button className="button button-soft" onClick={applyThisWeek}>
+            本周
+          </button>
+          <button className="button button-soft" onClick={applyThisMonth}>
+            本月
+          </button>
+          <button className="button button-soft" onClick={applyNext30Days}>
+            未来30天
+          </button>
+
+          <span
+            className="field-label"
+            style={{ marginLeft: 12 }}
+          >
+            资源名称
+          </span>
+          <input
+            className="input"
+            type="text"
+            placeholder="输入资源名称或编码"
+            value={resourceFilter}
+            onChange={e => setResourceFilter(e.target.value)}
+            style={{ minWidth: 180 }}
+          />
+        </div>
+        <div className="toolbar-right">
+          <div className="segmented">
+            <button
+              className={viewMode === 'shift' ? 'active' : ''}
+              onClick={() => setViewMode('shift')}
+            >
+              班次视图
+            </button>
+            <button
+              className={viewMode === 'effective' ? 'active' : ''}
+              onClick={() => setViewMode('effective')}
+            >
+              有效时间视图
+            </button>
+          </div>
+
+          <button className="button button-soft" onClick={handleExport}>
+            导出
+          </button>
+          <button className="button button-soft" onClick={handleImportClick}>
+            导入
+          </button>
+          <button
+            className="button button-soft"
+            disabled={!hasRowSelection}
+            onClick={() => hasRowSelection && openBulkPlan()}
+          >
+            批量修改排班计划
+          </button>
+          {/* 批量添加时间片（无需预先选中资源） */}
+          <button
+            className="button button-soft"
+            onClick={openBulkSlice}
+          >
+            批量添加时间片
+          </button>
+          <button
+            className="button button-soft"
+            disabled={!hasRowSelection}
+            onClick={() => hasRowSelection && openBulkDelete()}
+          >
+            批量删除排班详情
+          </button>
+        </div>
+      </div>
+
+      {/* 主表格 */}
+      <div className="layout">
+        <div className="card table-card">
+          {/* 列全选控件 */}
+          <div className="column-select-all">
+            <label className="column-select-label">
+              <input
+                type="checkbox"
+                checked={allColsSelected}
+                onChange={e => selectAllCols(e.target.checked)}
+              />
+              <span>列全选/取消全选</span>
+            </label>
+          </div>
+          <div className="schedule-table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th className="col-resource">
+                    <div className="resource-header">
+                      <input
+                        type="checkbox"
+                        checked={allRowsSelected}
+                        onChange={e => selectAllRows(e.target.checked)}
+                      />
+                      <span>资源</span>
+                    </div>
+                  </th>
+                  <th className="col-template">默认排班模板</th>
+                  {visibleDates.map(date => (
+                    <th key={date} className="col-date">
+                      <label className="th-date-label">
+                        <input
+                          type="checkbox"
+                          checked={selectedCols.includes(date)}
+                          onChange={() => toggleCol(date)}
+                        />
+                        <span>{date}</span>
+                      </label>
+                    </th>
+                  ))}
+                  <th className="col-actions">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredRows.map(row => (
+                  <tr key={row.id}>
+                    <td className="col-resource">
+                      <div className="resource-header">
+                        <input
+                          type="checkbox"
+                          checked={selectedRows.includes(row.id)}
+                          onChange={() => toggleRow(row.id)}
+                        />
+                        <div>
+                          <div className="resource-name">{row.name}</div>
+                          <div className="text-muted resource-code">
+                            {row.code}
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="col-template">
+                      <div
+                        className="template-pill"
+                        onClick={() => openPlan(row.id)}
+                      >
+                        <span>{row.templateName}</span>
+                      </div>
+                    </td>
+                    {visibleDates.map(date => {
+                      const detail = row.details[date];
+                      if (!detail) {
+                        return (
+                          <td
+                            key={date}
+                            className="cell-schedule col-date"
+                            onClick={() => openDetail(row.id, date)}
+                          >
+                            {viewMode === 'shift' ? (
+                              <span className="chip chip-outline">未排班</span>
+                            ) : (
+                              <span className="chip chip-muted">无</span>
+                            )}
+                          </td>
+                        );
+                      }
+
+                      const templateNormalSlices = detail.slices.filter(
+                        s => s.isTemplate && s.type === 'normal',
+                      );
+                      const otherSlices = detail.slices.filter(
+                        s => !(s.isTemplate && s.type === 'normal'),
+                      );
+                      const effectiveRanges = computeEffectiveRanges(detail);
+
+                      return (
+                        <td
+                          key={date}
+                          className="cell-schedule col-date"
+                          onClick={() => openDetail(row.id, date)}
+                        >
+                          {viewMode === 'shift' ? (
+                            <div className="view-shift">
+                              {templateNormalSlices.length > 0 && (
+                                <span
+                                  className={chipClassForSlice(
+                                    row.templateName,
+                                    templateNormalSlices[0],
+                                  )}
+                                >
+                                  {row.templateName || '模板'}
+                                </span>
+                              )}
+                              {otherSlices.map(s => {
+                                const text = s.name.trim()
+                                  ? s.name
+                                  : sliceTypeLabel[s.type] || '未命名';
+                                return (
+                                  <span
+                                    key={s.id}
+                                    className={chipClassForSlice(
+                                      row.templateName,
+                                      s,
+                                    )}
+                                  >
+                                    {text}
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <div className="view-effective">
+                              {effectiveRanges.map((r, idx) => (
+                                <span
+                                  key={idx}
+                                  className="chip chip-effective"
+                                >
+                                  {r.label}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                      );
+                    })}
+                    <td className="row-actions col-actions">
+                      <button
+                        className="button button-soft"
+                        onClick={e => {
+                          e.stopPropagation();
+                          openRoll(row.id);
+                        }}
+                      >
+                        滚动排班
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      {/* 遮罩 */}
+      {anyLayerOpen && (
+        <div className="overlay show" onClick={closeAllLayers} />
+      )}
+
+      {/* 排班明细抽屉 */}
+      <div className={`drawer ${editingDetail ? 'show' : ''}`}>
+        {editingDetail && (
+          <>
+            <div className="drawer-header">
+              <div className="drawer-title">
+                {editingDetail.isNew ? '添加排班' : '编辑排班'} -{' '}
+                {getRowById(editingDetail.resourceId)?.name} -{' '}
+                {editingDetail.date}
+              </div>
+              <button className="icon-btn" onClick={closeDetail}>
+                ✕
+              </button>
+            </div>
+            <div className="drawer-body">
+              <div className="form-grid">
+                <div className="form-label">资源</div>
+                <div className="form-control">
+                  <input
+                    className="input"
+                    value={
+                      getRowById(editingDetail.resourceId)?.name || ''
+                    }
+                    disabled
+                  />
+                </div>
+                <div className="form-label">日期</div>
+                <div className="form-control">
+                  <input
+                    className="input"
+                    value={editingDetail.date}
+                    disabled
+                  />
+                </div>
+                <div className="form-label">当前模板</div>
+                <div className="form-control">
+                  <select
+                    className={
+                      'select' +
+                      (editingDetail.templateName
+                        ? ' template-select-on'
+                        : '')
+                    }
+                    value={editingDetail.templateName}
+                    onChange={e => changeDetailTemplate(e.target.value)}
+                  >
+                    <option value="">不使用模板（手工维护）</option>
+                    {Object.values(TEMPLATE_DEFS).map(t => (
+                      <option key={t.name} value={t.name}>
+                        {t.name}（{t.desc}）
+                      </option>
+                    ))}
+                  </select>
+                  <div className="text-muted template-hint">
+                    选择模板后，将按模板时间片刷新当前日期的排班；不使用模板时，可完全手工维护时间片。
+                  </div>
+                </div>
+              </div>
+
+              <div className="section-title">排班时间片</div>
+              <div className="section-sub">
+                有效时间段：{effectiveInfoInDetail.label || '无'}
+              </div>
+              <div className="section-sub">
+                有效可用时长：
+                {effectiveInfoInDetail.hours > 0
+                  ? `${effectiveInfoInDetail.hours.toFixed(1)} 小时`
+                  : '0 小时'}
+              </div>
+              <div className="section-sub">
+                时间只维护时分，通过“今日/次日”标记是否跨天。
+              </div>
+              <div className="time-slice-list">
+                {editingDetail.slices.map(s => (
+                  <div
+                    className={
+                      'slice-row' +
+                      (s.isTemplate ? ' slice-row-template' : '')
+                    }
+                    key={s.id}
+                  >
+                    <div className="slice-col-name">
+                      <input
+                        className="input"
+                        placeholder="时间片名称，如 白班8h、加班2h"
+                        value={s.name}
+                        onChange={e =>
+                          updateSlice(s.id, { name: e.target.value })
+                        }
+                      />
+                      <select
+                        className="select slice-type-select"
+                        value={s.type}
+                        onChange={e =>
+                          updateSlice(s.id, {
+                            type: e.target.value as SliceType,
+                          })
+                        }
+                      >
+                        <option value="normal">常规</option>
+                        <option value="overtime">加班</option>
+                        <option value="continuous">直落</option>
+                        <option value="leave">请假</option>
+                        <option value="fault">故障</option>
+                        <option value="maintenance">保养</option>
+                      </select>
+                    </div>
+                    <div className="slice-col-time">
+                      <div className="slice-time-row">
+                        <select
+                          className="select"
+                          value={s.startDay}
+                          onChange={e =>
+                            updateSlice(s.id, {
+                              startDay: Number(
+                                e.target.value,
+                              ) as DayFlag,
+                            })
+                          }
+                        >
+                          <option value={0}>今日</option>
+                          <option value={1}>次日</option>
+                        </select>
+                        <input
+                          className="input"
+                          type="time"
+                          value={s.start}
+                          onChange={e =>
+                            updateSlice(s.id, {
+                              start: e.target.value,
+                            })
+                          }
+                        />
+                      </div>
+                    </div>
+                    <div className="slice-col-time">
+                      <div className="slice-time-row">
+                        <select
+                          className="select"
+                          value={s.endDay}
+                          onChange={e =>
+                            updateSlice(s.id, {
+                              endDay: Number(
+                                e.target.value,
+                              ) as DayFlag,
+                            })
+                          }
+                        >
+                          <option value={0}>今日</option>
+                          <option value={1}>次日</option>
+                        </select>
+                        <input
+                          className="input"
+                          type="time"
+                          value={s.end}
+                          onChange={e =>
+                            updateSlice(s.id, { end: e.target.value })
+                          }
+                        />
+                      </div>
+                      {s.startDay === 0 && s.endDay === 1 && (
+                        <div className="slice-meta">跨天</div>
+                      )}
+                    </div>
+                    <div className="slice-col-actions">
+                      <button
+                        className="icon-btn"
+                        title="删除"
+                        onClick={() => removeSlice(s.id)}
+                      >
+                        🗑
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {editingDetail.slices.length === 0 && (
+                  <div className="text-muted slice-empty-tip">
+                    尚未配置时间片，可点击下方按钮新增。
+                  </div>
+                )}
+              </div>
+              <div className="slice-add">
+                <button className="button button-soft" onClick={addSlice}>
+                  + 添加时间片
+                </button>
+              </div>
+            </div>
+            <div className="drawer-footer">
+              <button className="button button-soft" onClick={closeDetail}>
+                取消
+              </button>
+              <button
+                className="button button-primary"
+                onClick={saveEditingDetail}
+              >
+                保存
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* 排班计划 Modal */}
+      {planContext && (
+        <div className="modal show">
+          <div className="modal-card">
+            <div className="modal-header">
+              <div className="modal-title">
+                编辑排班计划 - {getRowById(planContext)?.name}
+              </div>
+              <button className="icon-btn" onClick={closePlan}>
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="form-grid">
+                <div className="form-label">资源</div>
+                <div className="form-control">
+                  <input
+                    className="input"
+                    value={getRowById(planContext)?.name || ''}
+                    disabled
+                  />
+                </div>
+                <div className="form-label">默认模板</div>
+                <div className="form-control">
+                  <select
+                    className="select"
+                    value={planTemplateName}
+                    onChange={e => setPlanTemplateName(e.target.value)}
+                  >
+                    {Object.values(TEMPLATE_DEFS).map(t => (
+                      <option key={t.name} value={t.name}>
+                        {t.name}（{t.desc}）
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-label">滚动排班</div>
+                <div className="form-control">
+                  <label className="switch on">
+                    <div className="switch-track">
+                      <div className="switch-thumb" />
+                    </div>
+                    已开启
+                  </label>
+                  <div
+                    className="text-muted"
+                    style={{ marginTop: 4 }}
+                  >
+                    系统会按默认模板和步长自动生成未来排班。
+                  </div>
+                </div>
+                <div className="form-label">步长（天）</div>
+                <div className="form-control">
+                  <input
+                    className="input"
+                    type="number"
+                    defaultValue={30}
+                  />
+                </div>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="button button-soft"
+                onClick={closePlan}
+              >
+                取消
+              </button>
+              <button
+                className="button button-primary"
+                onClick={savePlanTemplate}
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 滚动排班 Modal */}
+      {rollContext && (
+        <div className="modal show">
+          <div className="modal-card">
+            <div className="modal-header">
+              <div className="modal-title">
+                滚动排班 - {getRowById(rollContext)?.name}
+              </div>
+              <button className="icon-btn" onClick={closeRoll}>
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="form-grid">
+                <div className="form-label">日期范围</div>
+                <div className="form-control">
+                  <input
+                    className="input"
+                    type="date"
+                    value={rollConfig.start}
+                    onChange={e =>
+                      setRollConfig(cfg => ({
+                        ...cfg,
+                        start: e.target.value,
+                      }))
+                    }
+                  />
+                  <span style={{ margin: '0 4px' }}>~</span>
+                  <input
+                    className="input"
+                    type="date"
+                    value={rollConfig.end}
+                    onChange={e =>
+                      setRollConfig(cfg => ({
+                        ...cfg,
+                        end: e.target.value,
+                      }))
+                    }
+                  />
+                </div>
+                <div className="form-label">排班模式</div>
+                <div className="form-control">
+                  <ul className="mode-list">
+                    <li>
+                      <label>
+                        <input
+                          type="radio"
+                          name="rollMode"
+                          checked={
+                            rollConfig.mode === 'onlyEmpty'
+                          }
+                          onChange={() =>
+                            setRollConfig(cfg => ({
+                              ...cfg,
+                              mode: 'onlyEmpty',
+                            }))
+                          }
+                        />{' '}
+                        <span className="mode-title">
+                          仅填空白日期
+                        </span>
+                      </label>
+                      <div className="mode-desc">
+                        只为当前没有任何排班明细的日期生成排班，不修改已有明细。
+                      </div>
+                    </li>
+                    <li>
+                      <label>
+                        <input
+                          type="radio"
+                          name="rollMode"
+                          checked={
+                            rollConfig.mode === 'replaceTemplate'
+                          }
+                          onChange={() =>
+                            setRollConfig(cfg => ({
+                              ...cfg,
+                              mode: 'replaceTemplate',
+                            }))
+                          }
+                        />{' '}
+                        <span className="mode-title">
+                          覆盖模板时间片
+                        </span>
+                      </label>
+                      <div className="mode-desc">
+                        删除由模板生成的时间片，保留手动时间片，然后按默认模板重新生成。
+                      </div>
+                    </li>
+                    <li>
+                      <label>
+                        <input
+                          type="radio"
+                          name="rollMode"
+                          checked={
+                            rollConfig.mode === 'replaceAll'
+                          }
+                          onChange={() =>
+                            setRollConfig(cfg => ({
+                              ...cfg,
+                              mode: 'replaceAll',
+                            }))
+                          }
+                        />{' '}
+                        <span className="mode-title">
+                          全部覆盖
+                        </span>
+                      </label>
+                      <div className="mode-desc">
+                        删除日期范围内所有时间片，完全按默认模板重建。
+                      </div>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="button button-soft"
+                onClick={closeRoll}
+              >
+                取消
+              </button>
+              <button
+                className="button button-primary"
+                onClick={executeRoll}
+              >
+                执行滚动排班
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 批量修改排班计划 Modal */}
+      {bulkPlanOpen && (
+        <div className="modal show">
+          <div className="modal-card">
+            <div className="modal-header">
+              <div className="modal-title">批量修改排班计划</div>
+              <button className="icon-btn" onClick={closeBulkPlan}>
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p>将为以下资源批量更换默认排班模板：</p>
+              <p className="bulk-targets">
+                {bulkPlanTargets || '（无资源被选中）'}
+              </p>
+              <div className="section-title">选择新的默认模板</div>
+              <select
+                className="select"
+                style={{ width: '100%', marginTop: 4 }}
+              >
+                {Object.values(TEMPLATE_DEFS).map(t => (
+                  <option key={t.name} value={t.name}>
+                    {t.name}（{t.desc}）
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="button button-soft"
+                onClick={closeBulkPlan}
+              >
+                取消
+              </button>
+              <button className="button button-primary">
+                确定
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 批量添加时间片 Modal */}
+      {bulkSliceOpen && (
+        <div className="modal show">
+          <div className="modal-card">
+            <div className="modal-header">
+              <div className="modal-title">批量添加时间片</div>
+              <button className="icon-btn" onClick={closeBulkSlice}>
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <div className="section-title">选择资源</div>
+              <div className="text-muted" style={{ marginBottom: 6 }}>
+                默认勾选当前表格中已选中的资源，可在下方继续调整。
+              </div>
+              <div
+                style={{
+                  maxHeight: 140,
+                  overflow: 'auto',
+                  border: '1px solid #e5e7eb',
+                  borderRadius: 8,
+                  padding: 8,
+                }}
+              >
+                {rows.map(r => (
+                  <label
+                    key={r.id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      fontSize: 13,
+                      marginBottom: 4,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={bulkSliceConfig.resourceIds.includes(r.id)}
+                      onChange={e => {
+                        const checked = e.target.checked;
+                        setBulkSliceConfig(cfg => ({
+                          ...cfg,
+                          resourceIds: checked
+                            ? [...cfg.resourceIds, r.id]
+                            : cfg.resourceIds.filter(id => id !== r.id),
+                        }));
+                      }}
+                    />
+                    <span>{r.name}</span>
+                    <span className="text-muted">({r.code})</span>
+                  </label>
+                ))}
+                {rows.length === 0 && (
+                  <div className="text-muted">暂无资源</div>
+                )}
+              </div>
+
+              <div className="section-title" style={{ marginTop: 12 }}>
+                时间范围
+              </div>
+              <div className="form-grid">
+                <div className="form-label">开始</div>
+                <div className="form-control">
+                  <div style={{ display: 'flex', gap: 4 }}>
+                    <input
+                      className="input"
+                      type="date"
+                      value={bulkSliceConfig.startDate}
+                      onChange={e =>
+                        setBulkSliceConfig(cfg => ({
+                          ...cfg,
+                          startDate: e.target.value,
+                        }))
+                      }
+                    />
+                    <input
+                      className="input"
+                      type="time"
+                      value={bulkSliceConfig.startTime}
+                      onChange={e =>
+                        setBulkSliceConfig(cfg => ({
+                          ...cfg,
+                          startTime: e.target.value,
+                        }))
+                      }
+                    />
+                  </div>
+                </div>
+                <div className="form-label">结束</div>
+                <div className="form-control">
+                  <div style={{ display: 'flex', gap: 4 }}>
+                    <input
+                      className="input"
+                      type="date"
+                      value={bulkSliceConfig.endDate}
+                      onChange={e =>
+                        setBulkSliceConfig(cfg => ({
+                          ...cfg,
+                          endDate: e.target.value,
+                        }))
+                      }
+                    />
+                    <input
+                      className="input"
+                      type="time"
+                      value={bulkSliceConfig.endTime}
+                      onChange={e =>
+                        setBulkSliceConfig(cfg => ({
+                          ...cfg,
+                          endTime: e.target.value,
+                        }))
+                      }
+                    />
+                  </div>
+                </div>
+              </div>
+              <div className="text-muted" style={{ fontSize: 11 }}>
+                若时间范围跨多天，系统会按每天拆分一段时间片，尽量避免跨天时间片。
+              </div>
+
+              <div className="section-title" style={{ marginTop: 12 }}>
+                时间片类型
+              </div>
+              <div className="form-grid">
+                <div className="form-label">类型</div>
+                <div className="form-control">
+                  <select
+                    className="select"
+                    value={bulkSliceConfig.type}
+                    onChange={e =>
+                      setBulkSliceConfig(cfg => ({
+                        ...cfg,
+                        type: e.target.value as SliceType,
+                      }))
+                    }
+                  >
+                    <option value="normal">常规</option>
+                    <option value="overtime">加班</option>
+                    <option value="continuous">直落</option>
+                    <option value="leave">请假</option>
+                    <option value="fault">故障</option>
+                    <option value="maintenance">保养</option>
+                  </select>
+                </div>
+                <div className="form-label">名称</div>
+                <div className="form-control">
+                  <input
+                    className="input"
+                    placeholder="可选，如：集中加班2h"
+                    value={bulkSliceConfig.name}
+                    onChange={e =>
+                      setBulkSliceConfig(cfg => ({
+                        ...cfg,
+                        name: e.target.value,
+                      }))
+                    }
+                  />
+                </div>
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="button button-soft"
+                onClick={closeBulkSlice}
+              >
+                取消
+              </button>
+              <button
+                className="button button-primary"
+                onClick={executeBulkAddSlices}
+              >
+                生成时间片
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 批量删除排班详情 Modal */}
+      {bulkDeleteOpen && (
+        <div className="modal show">
+          <div className="modal-card">
+            <div className="modal-header">
+              <div className="modal-title">批量删除排班详情</div>
+              <button className="icon-btn" onClick={closeBulkDelete}>
+                ✕
+              </button>
+            </div>
+            <div className="modal-body">
+              <p style={{ whiteSpace: 'pre-line' }}>
+                {bulkDeleteSummary}
+              </p>
+              <p className="text-muted">
+                删除后将无法恢复，请确认是否继续。
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="button button-soft"
+                onClick={closeBulkDelete}
+              >
+                取消
+              </button>
+              <button className="button button-primary">
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
 ```
-
-然后在抽屉内容里，把原来的两行说明改成这样：
-
-```tsx
-<div className="section-title">排班时间片</div>
-<div className="section-sub">
-  有效时间段：{effectiveInfoInDetail.label || '无'}
-</div>
-<div className="section-sub">
-  有效可用时长：
-  {effectiveInfoInDetail.hours > 0
-    ? `${effectiveInfoInDetail.hours.toFixed(1)} 小时`
-    : '0 小时'}
-</div>
-<div className="section-sub">
-  时间只维护时分，通过“今日/次日”标记是否跨天。
-</div>
-```
-
-> 你给的例子：
->
-> * 常规：08:00–18:00 → 10 小时可用
-> * 请假：16:00–18:00（不可用）
->   可用区间会被计算成：08:00–16:00（8 小时）
->   抽屉里显示：
-> * 有效时间段：`08:00 ~ 16:00`
-> * 有效可用时长：`8.0 小时`
->   完全符合「不可用时间片优先覆盖可用时间」的要求。
 
 ---
 
-## 五、效果总结
+## App.css（在你原来的基础上，末尾加了 `.bulk-targets` 等小样式）
 
-改完之后：
+如果你之前就是用的这份 CSS，可以直接替换；如果已经有类似样式，只要把新增部分合并进去即可。
 
-1. **列表页「有效时间视图」**
-   显示的时间段已经自动扣掉了请假/故障/保养等不可用时间片。
-2. **详情抽屉**
+```css
+root {
+  --bg: #f5f7fa;
+  --card-bg: #ffffff;
+  --border: #e0e4eb;
+  --border-soft: #edf0f5;
+  --primary: #2563eb;
+  --primary-soft: #e3edff;
+  --primary-dark: #1d4ed8;
+  --text-main: #111827;
+  --text-sub: #6b7280;
+  --text-light: #9ca3af;
+  --danger: #dc2626;
+  --radius-card: 12px;
+  --radius-pill: 999px;
+  --shadow-soft: 0 10px 30px rgba(15, 23, 42, 0.1);
 
-   * 「有效时间段」会按扣减后的区间拼出来；
-   * 「有效可用时长」是这些区间的总时长（分钟累加 / 60），例如 8.0 小时。
-3. 跨天时间片仍用原有的 `startDay/endDay` 方案表示，不会破坏你现在的显示逻辑。
+  /* 固定列宽度，避免错位与遮挡 */
+  --col-resource-width: 220px;
+  --col-template-width: 190px;
+}
 
-如果你愿意，我可以帮你把这些改动再整理成一份“完整 App.tsx 合并版”，方便直接对比 / 覆盖。
+* {
+  box-sizing: border-box;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-main);
+}
+
+.page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 24px;
+  gap: 12px;
+}
+
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.page-title {
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.page-subtitle {
+  font-size: 12px;
+  color: var(--text-sub);
+  margin-top: 4px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--card-bg);
+  padding: 12px 16px;
+  border-radius: var(--radius-card);
+  border: 1px solid var(--border-soft);
+  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.02);
+}
+
+.toolbar-left,
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.field-label {
+  font-size: 13px;
+  color: var(--text-sub);
+  margin-right: 4px;
+}
+
+.input,
+.select,
+.button {
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text-main);
+  outline: none;
+}
+
+.input:focus,
+.select:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.15);
+}
+
+.button {
+  cursor: pointer;
+  border-radius: var(--radius-pill);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.button-primary {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
+.button-primary:hover {
+  background: var(--primary-dark);
+}
+
+.button-soft {
+  background: #fff;
+  border-color: var(--border);
+  color: var(--text-sub);
+}
+
+.button-soft:hover {
+  border-color: var(--primary);
+  color: var(--primary-dark);
+}
+
+.button-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-sub);
+}
+
+.button-ghost:hover {
+  background: #e5e7eb;
+}
+
+.button[disabled] {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.segmented {
+  display: inline-flex;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  background: #f9fafb;
+}
+
+.segmented button {
+  border: none;
+  padding: 6px 10px;
+  font-size: 12px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-sub);
+  min-width: 80px;
+}
+
+.segmented button.active {
+  background: #fff;
+  color: var(--primary-dark);
+  font-weight: 500;
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.1);
+}
+
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-sub);
+  cursor: pointer;
+}
+
+.switch-track {
+  width: 32px;
+  height: 18px;
+  border-radius: 999px;
+  background: #e5e7eb;
+  padding: 2px;
+  box-sizing: border-box;
+  transition: background 0.2s;
+}
+
+.switch-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.2s;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+
+.switch.on .switch-track {
+  background: var(--primary);
+}
+
+.switch.on .switch-thumb {
+  transform: translateX(14px);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  position: relative;
+}
+
+.card {
+  background: var(--card-bg);
+  border-radius: var(--radius-card);
+  border: 1px solid var(--border-soft);
+  padding: 12px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.03);
+  overflow: hidden;
+}
+
+.schedule-table-wrapper {
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: calc(100vh - 220px);
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+thead {
+  background: #f9fafb;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+th,
+td {
+  border-bottom: 1px solid var(--border-soft);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+th {
+  font-weight: 500;
+  color: var(--text-sub);
+}
+
+tbody tr:hover td {
+  background: #f9fafb;
+}
+
+/* 固定列：资源列 + 模板列 + 操作列 */
+.col-resource,
+.col-template {
+  position: sticky;
+  background: #fff;
+  z-index: 2;
+}
+
+.col-resource {
+  left: 0;
+  min-width: var(--col-resource-width);
+  width: var(--col-resource-width);
+  max-width: var(--col-resource-width);
+}
+
+.col-template {
+  left: var(--col-resource-width);
+  min-width: var(--col-template-width);
+  width: var(--col-template-width);
+  max-width: var(--col-template-width);
+  border-left: 1px solid var(--border-soft);
+  /* 右侧更明显的投影，和日期列分割 */
+  box-shadow: 8px 0 10px -4px rgba(15, 23, 42, 0.35);
+}
+
+.col-date {
+  min-width: 90px;
+}
+
+.col-actions {
+  position: sticky;
+  right: 0;
+  background: #fff;
+  z-index: 3;
+  /* 左侧更明显的投影，和日期列分割 */
+  box-shadow: -8px 0 10px -4px rgba(15, 23, 42, 0.35);
+}
+
+/* 模板列 & 日期列字体稍大一点 */
+th.col-template,
+td.col-template,
+th.col-date,
+td.col-date {
+  font-size: 14px;
+}
+
+.resource-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.resource-name {
+  font-weight: 500;
+}
+
+.template-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-soft);
+  background: #f9fafb;
+  font-size: 13px;
+  cursor: pointer;
+  max-width: 160px;
+}
+
+.template-pill span {
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+
+.template-pill:hover {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary-dark);
+}
+
+.chip {
+  display: block;
+  padding: 2px 6px;
+  border-radius: var(--radius-pill);
+  background: #eef2ff;
+  color: #4338ca;
+  font-size: 11px;
+  margin: 1px 0;
+  width: fit-content;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chip-muted {
+  background: #f3f4f6;
+  color: #4b5563;
+}
+
+.chip-outline {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  color: #4b5563;
+}
+
+.cell-schedule {
+  cursor: pointer;
+}
+
+.row-actions {
+  text-align: right;
+}
+
+.view-effective {
+  margin-top: 2px;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* Drawer & Modals */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.24);
+  display: none;
+  z-index: 20;
+}
+
+.overlay.show {
+  display: block;
+}
+
+@keyframes drawerIn {
+  from {
+    transform: translateX(40px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: -650px;
+  width: 650px;
+  max-width: 96vw;
+  height: 100vh;
+  background: #ffffff;
+  box-shadow: -10px 0 30px rgba(15, 23, 42, 0.2);
+  transition: right 0.25s ease;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  pointer-events: none;
+}
+
+.drawer.show {
+  right: 0;
+  pointer-events: auto;
+  animation: drawerIn 0.25s ease-out;
+}
+
+.drawer-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-soft);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.drawer-title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.drawer-body {
+  padding: 16px 20px 80px;
+  flex: 1;
+  overflow: auto;
+}
+
+.drawer-footer {
+  position: sticky;
+  bottom: 0;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-soft);
+  background: #fff;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  gap: 10px 8px;
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+
+.form-label {
+  text-align: right;
+  color: var(--text-sub);
+  padding-top: 6px;
+}
+
+.form-control {
+  width: 100%;
+}
+
+.section-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 12px 0 6px;
+}
+
+.section-sub {
+  font-size: 11px;
+  color: var(--text-sub);
+  margin-bottom: 6px;
+}
+
+/* 调大时间片区域高度 */
+.time-slice-list {
+  border-radius: 8px;
+  border: 1px solid var(--border-soft);
+  background: #f9fafb;
+  padding: 8px;
+  max-height: 340px;
+  overflow: auto;
+}
+
+/* 调高每条时间片块的高度 */
+.slice-row {
+  display: grid;
+  grid-template-columns: 1.6fr 1.3fr 1.3fr 32px;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 8px;
+  background: #fff;
+  border-radius: 6px;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+}
+
+.slice-row-template {
+  background: #f3f4ff;
+  border-color: #d4d4ff;
+}
+
+.slice-col-name,
+.slice-col-time {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.slice-time-row {
+  display: flex;
+  gap: 4px;
+}
+
+.slice-type-select {
+  font-size: 12px;
+}
+
+.slice-col-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
+}
+
+.slice-empty-tip {
+  padding: 4px 2px;
+}
+
+.text-muted {
+  color: var(--text-sub);
+  font-size: 12px;
+}
+
+.icon-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text-sub);
+}
+
+.icon-btn:hover {
+  border-color: var(--primary);
+  color: var(--primary-dark);
+}
+
+/* Centered modal */
+.modal {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 40;
+}
+
+.modal.show {
+  display: flex;
+}
+
+.modal-card {
+  width: 480px;
+  max-width: 92vw;
+  background: #fff;
+  border-radius: 14px;
+  box-shadow: var(--shadow-soft);
+  border: 1px solid var(--border-soft);
+  padding: 18px 20px 12px;
+  display: flex;
+  flex-direction: column;
+  max-height: 80vh;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.modal-title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.modal-body {
+  flex: 1;
+  overflow: auto;
+  padding-right: 4px;
+  font-size: 13px;
+}
+
+.modal-footer {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.mode-list {
+  font-size: 13px;
+  list-style: none;
+  padding-left: 0;
+  margin: 6px 0 0;
+}
+
+.mode-list li {
+  margin-bottom: 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border-soft);
+  padding: 6px 8px;
+}
+
+.mode-title {
+  font-weight: 500;
+}
+
+.mode-desc {
+  font-size: 11px;
+  color: var(--text-sub);
+}
+
+.tag-danger {
+  font-size: 11px;
+  color: var(--danger);
+  background: #fef2f2;
+  border-radius: var(--radius-pill);
+  padding: 2px 6px;
+  margin-left: 6px;
+}
+
+@media (max-width: 960px) {
+  .page {
+    padding: 12px;
+  }
+
+  .toolbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  :root {
+    --col-resource-width: 180px;
+    --col-template-width: 170px;
+  }
+
+  .drawer {
+    width: 100%;
+    right: -100%;
+  }
+}
+
+/* 模板 chip 颜色 */
+.chip-template-day {
+  background: #e0edff;
+  color: #1d4ed8;
+}
+
+.chip-template-night {
+  background: #ede9fe;
+  color: #5b21b6;
+}
+
+.chip-template-standard {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.chip-template-two {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+/* 有效时间视图的 chip */
+.chip-effective {
+  background: #e5f0ff;
+  color: #1e40af;
+}
+
+/* 右上角列全选区域 */
+.column-select-all {
+  position: absolute;
+  right: 20px;
+  top: -10px;
+}
+
+.column-select-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #fff;
+  border: 1px solid var(--border-soft);
+  font-size: 12px;
+  color: var(--text-sub);
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.1);
+}
+
+/* 表头日期 */
+.th-date-label {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+/* 资源编码更细一点 */
+.resource-code {
+  font-size: 11px;
+}
+
+/* 抽屉内部一些间距 */
+.slice-add {
+  margin-top: 6px;
+}
+
+.template-hint {
+  font-size: 12px;
+}
+
+/* 模态框弹出缩放动画（打开时从小到大） */
+.modal.show .modal-card {
+  animation: modalIn 0.18s ease-out;
+}
+
+@keyframes modalIn {
+  from {
+    transform: scale(0.9);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* 当前模板下拉框颜色（固定），与模板时间片背景一致 */
+.select.template-select-on {
+  background: #f3f4ff;
+  color: #111827;
+  border-color: #d4d4ff;
+}
+
+/* 加一点批量目标展示的样式 */
+.bulk-targets {
+  margin: 6px 0;
+  font-size: 13px;
+  color: var(--text-main);
+  white-space: pre-line;
+}
+```
+
+---
+
+如果你之后想加「导入预览（显示会影响多少资源/日期）」或者「导入策略选择（覆盖 / 仅追加）」之类的高级功能，也可以在当前导入逻辑的基础上继续扩展，我可以再帮你往上叠一层。
