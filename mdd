@@ -1,62 +1,15 @@
-可以做到，而且可以复用你现在「批量修改排班计划 / 批量删除排班详情」这套弹框逻辑来做一个「批量添加时间片」功能。下面我分步骤说怎么改，代码都按你现有结构来写。
+好，改这个交互很简单，核心就是两点：
+
+1. 按钮永远可点，不再依赖「已选资源」。
+2. 弹框打开时，如果没有选中行，就默认不勾选任何资源（`resourceIds: []`）。
+
+下面按你现有代码结构说具体要改哪几处。
 
 ---
 
-## 1. 新增状态：控制弹框 + 配置
+## 1️⃣ 按钮：永远可点击
 
-在 `App` 组件中其他 state 附近，加两个 state：
-
-```tsx
-// 在现有的 bulkPlanOpen / bulkDeleteOpen 旁边加：
-const [bulkSliceOpen, setBulkSliceOpen] = useState(false);
-const [bulkSliceConfig, setBulkSliceConfig] = useState<{
-  resourceIds: string[];
-  startDate: string;
-  startTime: string;
-  endDate: string;
-  endTime: string;
-  type: SliceType;
-  name: string;
-}>({
-  resourceIds: [],
-  startDate: DATES[0],
-  startTime: '08:00',
-  endDate: DATES[0],
-  endTime: '17:00',
-  type: 'overtime',
-  name: '',
-});
-```
-
-再加几个打开/关闭方法（和现有的 `openBulkPlan` 类似）：
-
-```tsx
-const openBulkSlice = () => {
-  // 默认用当前勾选的资源，没有勾选可以先给空数组
-  setBulkSliceConfig(cfg => ({
-    ...cfg,
-    resourceIds: selectedRows.length ? [...selectedRows] : [],
-    startDate: dateStart,
-    endDate: dateStart,
-  }));
-  setBulkSliceOpen(true);
-};
-
-const closeBulkSlice = () => setBulkSliceOpen(false);
-```
-
-> 说明：
->
-> * `resourceIds` 用来在弹框中勾选要应用的资源。
-> * 时间范围用「开始日期+时间」和「结束日期+时间」组合。
-> * `type` 就是你已有的 `SliceType` 类型。
-> * `name` 可选，留空时，列表里会用类型中文名展示（你已有逻辑支持）。
-
----
-
-## 2. 在工具栏加一个入口按钮
-
-在顶部工具栏右侧按钮区域（导出 / 导入 / 批量修改 / 批量删除那一块）再加一个按钮，例如放在批量删除前面：
+现在工具栏右侧有一排按钮，你之前可能是这样写的（参考你现有批量按钮写法）：
 
 ```tsx
 <button
@@ -68,330 +21,123 @@ const closeBulkSlice = () => setBulkSliceOpen(false);
 </button>
 ```
 
-这里我沿用你现有的「必须先勾选资源行」的交互：
-用户在表格左侧勾选资源 → 点击「批量添加时间片」→ 弹框里默认勾上这些资源。
-
----
-
-## 3. 新增弹框 UI：选择资源 + 时间范围 + 类型
-
-参考你现有的几个 Modal，直接加一个新的 JSX 块：
+改成**不判断选中状态**：
 
 ```tsx
-{/* 批量添加时间片 Modal */}
-{bulkSliceOpen && (
-  <div className="modal show">
-    <div className="modal-card">
-      <div className="modal-header">
-        <div className="modal-title">批量添加时间片</div>
-        <button className="icon-btn" onClick={closeBulkSlice}>
-          ✕
-        </button>
-      </div>
-      <div className="modal-body">
-        {/* 资源选择 */}
-        <div className="section-title">选择资源</div>
-        <div className="text-muted" style={{ marginBottom: 6 }}>
-          默认勾选当前表格中已选中的资源，可在下方继续调整。
-        </div>
-        <div style={{ maxHeight: 140, overflow: 'auto', border: '1px solid var(--border-soft)', borderRadius: 8, padding: 8 }}>
-          {rows.map(r => (
-            <label
-              key={r.id}
-              style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, marginBottom: 4 }}
-            >
-              <input
-                type="checkbox"
-                checked={bulkSliceConfig.resourceIds.includes(r.id)}
-                onChange={e => {
-                  const checked = e.target.checked;
-                  setBulkSliceConfig(cfg => ({
-                    ...cfg,
-                    resourceIds: checked
-                      ? [...cfg.resourceIds, r.id]
-                      : cfg.resourceIds.filter(id => id !== r.id),
-                  }));
-                }}
-              />
-              <span>{r.name}</span>
-              <span className="text-muted">({r.code})</span>
-            </label>
-          ))}
-          {rows.length === 0 && (
-            <div className="text-muted">暂无资源</div>
-          )}
-        </div>
-
-        {/* 时间范围 */}
-        <div className="section-title" style={{ marginTop: 12 }}>时间范围</div>
-        <div className="form-grid">
-          <div className="form-label">开始</div>
-          <div className="form-control">
-            <div style={{ display: 'flex', gap: 4 }}>
-              <input
-                className="input"
-                type="date"
-                value={bulkSliceConfig.startDate}
-                onChange={e =>
-                  setBulkSliceConfig(cfg => ({
-                    ...cfg,
-                    startDate: e.target.value,
-                  }))
-                }
-              />
-              <input
-                className="input"
-                type="time"
-                value={bulkSliceConfig.startTime}
-                onChange={e =>
-                  setBulkSliceConfig(cfg => ({
-                    ...cfg,
-                    startTime: e.target.value,
-                  }))
-                }
-              />
-            </div>
-          </div>
-          <div className="form-label">结束</div>
-          <div className="form-control">
-            <div style={{ display: 'flex', gap: 4 }}>
-              <input
-                className="input"
-                type="date"
-                value={bulkSliceConfig.endDate}
-                onChange={e =>
-                  setBulkSliceConfig(cfg => ({
-                    ...cfg,
-                    endDate: e.target.value,
-                  }))
-                }
-              />
-              <input
-                className="input"
-                type="time"
-                value={bulkSliceConfig.endTime}
-                onChange={e =>
-                  setBulkSliceConfig(cfg => ({
-                    ...cfg,
-                    endTime: e.target.value,
-                  }))
-                }
-              />
-            </div>
-          </div>
-        </div>
-        <div className="text-muted" style={{ fontSize: 11 }}>
-          若时间范围跨多天，系统会自动按「每天切一段」拆分时间片，尽量避免跨天时间片。
-        </div>
-
-        {/* 时间片类型 + 名称 */}
-        <div className="section-title" style={{ marginTop: 12 }}>时间片类型</div>
-        <div className="form-grid">
-          <div className="form-label">类型</div>
-          <div className="form-control">
-            <select
-              className="select"
-              value={bulkSliceConfig.type}
-              onChange={e =>
-                setBulkSliceConfig(cfg => ({
-                  ...cfg,
-                  type: e.target.value as SliceType,
-                }))
-              }
-            >
-              <option value="normal">常规</option>
-              <option value="overtime">加班</option>
-              <option value="continuous">直落</option>
-              <option value="leave">请假</option>
-              <option value="fault">故障</option>
-              <option value="maintenance">保养</option>
-            </select>
-          </div>
-          <div className="form-label">名称</div>
-          <div className="form-control">
-            <input
-              className="input"
-              placeholder="可选，如：集中加班2h"
-              value={bulkSliceConfig.name}
-              onChange={e =>
-                setBulkSliceConfig(cfg => ({
-                  ...cfg,
-                  name: e.target.value,
-                }))
-              }
-            />
-          </div>
-        </div>
-      </div>
-      <div className="modal-footer">
-        <button className="button button-soft" onClick={closeBulkSlice}>
-          取消
-        </button>
-        <button
-          className="button button-primary"
-          onClick={executeBulkAddSlices}
-        >
-          生成时间片
-        </button>
-      </div>
-    </div>
-  </div>
-)}
+<button
+  className="button button-soft"
+  onClick={openBulkSlice}
+>
+  批量添加时间片
+</button>
 ```
 
+这样无论有没有勾选资源行，按钮都能点。
+
 ---
 
-## 4. 核心逻辑：按日期拆分时间段并生成时间片（尽量不跨天）
+## 2️⃣ 打开弹框时，默认资源列表不勾选（但有选中行时可以顺带勾上）
 
-关键是 `executeBulkAddSlices`：
-
-1. 把用户输入的开始、结束日期 + 时间转成完整 `Date`。
-2. 遍历这期间的每一天，算出“这一天内这段范围的交集”。
-3. 对每个资源、每一天，如果有交集，就生成一个时间片挂在对应日期上。
-4. 生成时 **只让时间片落在当天 00:00–24:00 范围内**，这样时间片本身不会跨多天。只有**恰好到 00:00** 的那种才需要用 `endDay=1` 表示跨到次日 0 点。
-
-示例实现：
+`openBulkSlice` 的实现可以写成这样（保留「有选中行就预勾选」的便利性；如果用户啥都没选，就是空数组）：
 
 ```tsx
-const executeBulkAddSlices = () => {
-  const { resourceIds, startDate, startTime, endDate, endTime, type, name } =
-    bulkSliceConfig;
-
-  if (!resourceIds.length) {
-    // 没选资源就直接关掉或给个提示，这里简单处理
-    setBulkSliceOpen(false);
-    return;
-  }
-
-  const startDateObj = parseDate(startDate);
-  const endDateObj = parseDate(endDate);
-
-  const [sh, sm] = startTime.split(':').map(Number);
-  const [eh, em] = endTime.split(':').map(Number);
-
-  const globalStart = new Date(
-    startDateObj.getFullYear(),
-    startDateObj.getMonth(),
-    startDateObj.getDate(),
-    sh,
-    sm,
-    0,
-    0,
-  );
-  const globalEnd = new Date(
-    endDateObj.getFullYear(),
-    endDateObj.getMonth(),
-    endDateObj.getDate(),
-    eh,
-    em,
-    0,
-    0,
-  );
-
-  // 结束早于或等于开始，直接忽略
-  if (globalEnd <= globalStart) {
-    setBulkSliceOpen(false);
-    return;
-  }
-
-  // 遍历全局开始到结束之间的每一天
-  const dayList: string[] = [];
-  {
-    const d = new Date(
-      globalStart.getFullYear(),
-      globalStart.getMonth(),
-      globalStart.getDate(),
-    );
-    while (d <= globalEnd) {
-      dayList.push(formatDate(d));
-      d.setDate(d.getDate() + 1);
-    }
-  }
-
-  setRows(prev =>
-    prev.map(r => {
-      if (!resourceIds.includes(r.id)) return r;
-
-      const newDetails: Record<string, ScheduleDetail> = {
-        ...r.details,
-      };
-
-      dayList.forEach(dateStr => {
-        const dayStart = new Date(parseDate(dateStr));
-        dayStart.setHours(0, 0, 0, 0);
-        const nextDay = new Date(dayStart);
-        nextDay.setDate(nextDay.getDate() + 1);
-
-        // 求交集区间 [segStart, segEnd)
-        const segStart = globalStart > dayStart ? globalStart : dayStart;
-        const segEnd = globalEnd < nextDay ? globalEnd : nextDay;
-
-        if (segEnd <= segStart) return; // 这一天没有有效区间
-
-        // 把 segStart / segEnd 转回当天的时分
-        const stH = segStart.getHours();
-        const stM = segStart.getMinutes();
-        const enH = segEnd.getHours();
-        const enM = segEnd.getMinutes();
-
-        let startDay: DayFlag = 0;
-        let endDay: DayFlag = 0;
-        const startStr = `${pad2(stH)}:${pad2(stM)}`;
-
-        let endStr = `${pad2(enH)}:${pad2(enM)}`;
-
-        // 特殊情况：交集刚好到次日 00:00
-        // 这时候无法表示 24:00，所以用 endDay=1, end=00:00 表示跨到次日 0 点
-        if (
-          segEnd.getTime() === nextDay.getTime() &&
-          enH === 0 &&
-          enM === 0
-        ) {
-          endDay = 1;
-          endStr = '00:00';
-        }
-
-        const sliceToAdd: TimeSlice = {
-          id: genId(),
-          name: name.trim(),
-          type,
-          start: startStr,
-          end: endStr,
-          startDay,
-          endDay,
-          isTemplate: false,
-        };
-
-        const prevDetail = newDetails[dateStr] || { slices: [] };
-        newDetails[dateStr] = {
-          slices: [...prevDetail.slices, sliceToAdd],
-        };
-      });
-
-      return { ...r, details: newDetails };
-    }),
-  );
-
-  setBulkSliceOpen(false);
+const openBulkSlice = () => {
+  setBulkSliceConfig(cfg => ({
+    ...cfg,
+    resourceIds: selectedRows.length ? [...selectedRows] : [], // 没选时就是 []
+    startDate: dateStart,
+    endDate: dateStart,
+  }));
+  setBulkSliceOpen(true);
 };
 ```
 
-### 这个算法如何满足「尽量不跨天」？
+* 如果用户先勾选了几条资源，再点「批量添加时间片」，弹框里会帮他把这些资源勾上。
+* 如果用户啥也没勾选就点按钮，`selectedRows.length === 0`，`resourceIds` 就是 `[]`，也就是你要的「默认不勾选任何资源」。
 
-* 全局时间范围先被拆成按天的段：每个日期只处理 `[当天 00:00, 次日 00:00)` 这 24 小时。
-* 每个日期只生成一个**当天的交集片段**，所以绝大多数时间片都是 `startDay=0, endDay=0`，完全在当日。
-* 只有当某一天的交集刚好覆盖到午夜 00:00 时，才用 `endDay=1, end='00:00'` 表示跨到次日 0 点，这在你的数据结构里是唯一合理的表达方式。
+弹框里资源那一块我们之前是这么写的（滚动列表 + 多选框），会自动根据 `bulkSliceConfig.resourceIds` 来勾选：
 
-例如：
+```tsx
+{rows.map(r => (
+  <label key={r.id} ...>
+    <input
+      type="checkbox"
+      checked={bulkSliceConfig.resourceIds.includes(r.id)}
+      onChange={e => {
+        const checked = e.target.checked;
+        setBulkSliceConfig(cfg => ({
+          ...cfg,
+          resourceIds: checked
+            ? [...cfg.resourceIds, r.id]
+            : cfg.resourceIds.filter(id => id !== r.id),
+        }));
+      }}
+    />
+    <span>{r.name}</span>
+    <span className="text-muted">({r.code})</span>
+  </label>
+))}
+```
 
-* 选择时间范围：`2025-12-01 20:00` ~ `2025-12-03 04:00`
-
-  * 12-01：生成 20:00 ~ 24:00 → 保存为 `date=2025-12-01, startDay=0, start=20:00, endDay=1, end=00:00`
-  * 12-02：生成 00:00 ~ 24:00 → `00:00~00:00 + endDay=1`（整日，如果你愿意，也可以改为拆成多段）
-  * 12-03：生成 00:00 ~ 04:00 → `startDay=0, endDay=0, 00:00~04:00`
-
-这样前端展示时，每个日期列都只需要看自身 `details[date]` 就能完整渲染时间片，不需要跨日期联动。
+所以只要 `resourceIds` 初始是 `[]`，就不会默认勾任何资源。
 
 ---
 
-如果你希望我帮你把这些改动合并成一个“差异版 App.tsx”（能直接替换原文件那种），我也可以按完整文件整理一份给你。
+## 3️⃣ 记得把新弹框纳入遮罩/统一关闭（小细节）
+
+你现在控制遮罩和统一关闭的逻辑是这样的：
+
+```tsx
+const closeAllLayers = () => {
+  setEditingDetail(null);
+  setPlanContext(null);
+  setRollContext(null);
+  setBulkPlanOpen(false);
+  setBulkDeleteOpen(false);
+};
+
+const anyLayerOpen = !!(
+  editingDetail ||
+  planContext ||
+  rollContext ||
+  bulkPlanOpen ||
+  bulkDeleteOpen
+);
+```
+
+加了「批量添加时间片」后，记得把 `bulkSliceOpen` 也加进去：
+
+```tsx
+const closeAllLayers = () => {
+  setEditingDetail(null);
+  setPlanContext(null);
+  setRollContext(null);
+  setBulkPlanOpen(false);
+  setBulkDeleteOpen(false);
+  setBulkSliceOpen(false);   // ✅ 新增
+};
+
+const anyLayerOpen = !!(
+  editingDetail ||
+  planContext ||
+  rollContext ||
+  bulkPlanOpen ||
+  bulkDeleteOpen ||
+  bulkSliceOpen        // ✅ 新增
+);
+```
+
+这样点页面灰色遮罩时，这个弹框也会一起被关闭。
+
+---
+
+## 4️⃣ 其他逻辑不用因这个需求再改
+
+* 之前写的 `executeBulkAddSlices` 按日期拆分时间范围、尽量避免跨天时间片的算法可以原样用；
+* 即使用户没预先勾选资源，只要在弹框里勾了几个资源，确认后逻辑也完全一样；
+* 若用户在弹框里也一个资源都不勾，`resourceIds` 是 `[]`，`executeBulkAddSlices` 里面一开始就可以直接 `setBulkSliceOpen(false); return;`，避免生成无意义数据。
+
+---
+
+如果你愿意，我也可以帮你把：
+**现有 App.tsx + 新增状态 + 按钮 + Modal + 执行函数** 合成一个完整版本，方便直接覆盖粘贴。
