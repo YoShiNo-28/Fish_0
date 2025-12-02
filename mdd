@@ -1,143 +1,277 @@
-好，改这个交互很简单，核心就是两点：
+这个需求本质上就是：**把可用时间片当成“白底”，不可用时间片当成“橡皮擦”，先把所有可用时间片合并，再用不可用时间片去抹掉重叠部分**，得到最终有效时间段 + 有效可用时长。
 
-1. 按钮永远可点，不再依赖「已选资源」。
-2. 弹框打开时，如果没有选中行，就默认不勾选任何资源（`resourceIds: []`）。
-
-下面按你现有代码结构说具体要改哪几处。
+下面按你现有 `App.tsx` 来说怎么改（只动这一块逻辑）。
 
 ---
 
-## 1️⃣ 按钮：永远可点击
+## 一、核心思路
 
-现在工具栏右侧有一排按钮，你之前可能是这样写的（参考你现有批量按钮写法）：
+1. 把同一天的所有时间片拆成两类：
 
-```tsx
-<button
-  className="button button-soft"
-  disabled={!hasRowSelection}
-  onClick={() => hasRowSelection && openBulkSlice()}
->
-  批量添加时间片
-</button>
-```
+   * **可用**：`normal / overtime / continuous`
+   * **不可用**：`leave / fault / maintenance`
+2. 每个时间片转成一个「分钟区间」：
 
-改成**不判断选中状态**：
+   * `startMin = startDay * 1440 + HH*60 + MM`
+   * `endMin   = endDay * 1440 + HH*60 + MM`
+3. 分别对可用区间、不可用区间做一次“合并重叠区间”（union）。
+4. 用「可用区间合集」减去「不可用区间合集」，得到真正的有效区间。
+5. 有效区间的总分钟数就是 **有效可用时长**，把这些区间再转回 `(startDay, start, endDay, end)` 就能用你现有的 `formatTimeRange` 渲染「有效时间段」。
 
-```tsx
-<button
-  className="button button-soft"
-  onClick={openBulkSlice}
->
-  批量添加时间片
-</button>
-```
-
-这样无论有没有勾选资源行，按钮都能点。
+这样，无论不可用时间片怎么穿插、重叠，都会优先把对应时间抹掉，完全符合「不可用优先级高」的要求。
 
 ---
 
-## 2️⃣ 打开弹框时，默认资源列表不勾选（但有选中行时可以顺带勾上）
+## 二、实现一个 `computeEffectiveInfo`（考虑不可用时间片）
 
-`openBulkSlice` 的实现可以写成这样（保留「有选中行就预勾选」的便利性；如果用户啥都没选，就是空数组）：
+在 `App.tsx` 里，`isSliceAvailable` 和 `computeEffectiveRanges` 附近加 / 改如下逻辑：
+
+### 1. 小工具：时间片转分钟区间 + 合并区间工具
 
 ```tsx
-const openBulkSlice = () => {
-  setBulkSliceConfig(cfg => ({
-    ...cfg,
-    resourceIds: selectedRows.length ? [...selectedRows] : [], // 没选时就是 []
-    startDate: dateStart,
-    endDate: dateStart,
+const toMinutes = (time: string) => {
+  const h = parseInt(time.slice(0, 2), 10);
+  const m = parseInt(time.slice(3, 5), 10);
+  return h * 60 + m;
+};
+
+interface MinuteRange {
+  start: number;
+  end: number;
+}
+
+const sliceToRange = (s: TimeSlice): MinuteRange | null => {
+  const start = s.startDay * 24 * 60 + toMinutes(s.start);
+  const end = s.endDay * 24 * 60 + toMinutes(s.end);
+  // 防御一下无效时间片
+  if (end <= start) return null;
+  return { start, end };
+};
+
+const mergeRanges = (ranges: MinuteRange[]): MinuteRange[] => {
+  if (ranges.length === 0) return [];
+  const sorted = [...ranges].sort((a, b) => a.start - b.start);
+  const res: MinuteRange[] = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const cur = sorted[i];
+    const last = res[res.length - 1];
+    if (cur.start <= last.end) {
+      last.end = Math.max(last.end, cur.end);
+    } else {
+      res.push({ ...cur });
+    }
+  }
+  return res;
+};
+```
+
+### 2. 计算“有效区间 + 总分钟数”
+
+```tsx
+interface EffectiveInfo {
+  ranges: {
+    startDay: DayFlag;
+    start: string;
+    endDay: DayFlag;
+    end: string;
+  }[];
+  totalMinutes: number;
+}
+
+const computeEffectiveInfo = (detail: ScheduleDetail): EffectiveInfo => {
+  const availableRanges: MinuteRange[] = [];
+  const blockedRanges: MinuteRange[] = [];
+
+  detail.slices.forEach(s => {
+    const range = sliceToRange(s);
+    if (!range) return;
+    if (isSliceAvailable(s.type)) {
+      availableRanges.push(range);
+    } else {
+      // 请假 / 故障 / 保养 等都视为不可用
+      blockedRanges.push(range);
+    }
+  });
+
+  const availUnion = mergeRanges(availableRanges);
+  const blockUnion = mergeRanges(blockedRanges);
+
+  if (availUnion.length === 0) {
+    return { ranges: [], totalMinutes: 0 };
+  }
+
+  // 用不可用区间从可用区间里“扣除”
+  const resultRanges: MinuteRange[] = [];
+  let j = 0;
+
+  for (const a of availUnion) {
+    let curStart = a.start;
+
+    // 跳过完全在当前可用区间左边的不可用区间
+    while (j < blockUnion.length && blockUnion[j].end <= curStart) {
+      j++;
+    }
+
+    let k = j;
+    while (k < blockUnion.length && blockUnion[k].start < a.end) {
+      const b = blockUnion[k];
+
+      // 有一段 [curStart, b.start) 仍然有效
+      if (b.start > curStart) {
+        resultRanges.push({
+          start: curStart,
+          end: Math.min(b.start, a.end),
+        });
+      }
+
+      // 如果不可用区间已经覆盖到 a.end 甚至更远，这个可用区间后面就没了
+      if (b.end >= a.end) {
+        curStart = a.end;
+        break;
+      }
+
+      // 不可用区间在中间，向后推进 curStart，继续找下一个不可用区间
+      curStart = Math.max(curStart, b.end);
+      k++;
+    }
+
+    // 循环结束后，还有一截尾巴没被覆盖
+    if (curStart < a.end) {
+      resultRanges.push({ start: curStart, end: a.end });
+    }
+  }
+
+  const totalMinutes = resultRanges.reduce(
+    (sum, r) => sum + (r.end - r.start),
+    0,
+  );
+
+  // 把分钟数区间还原为 (DayFlag + HH:mm)
+  const ranges = resultRanges.map(r => {
+    const startDay: DayFlag = (r.start >= 24 * 60 ? 1 : 0) as DayFlag;
+    const startOffset = r.start - startDay * 24 * 60;
+    const sH = Math.floor(startOffset / 60);
+    const sM = startOffset % 60;
+
+    const endDay: DayFlag = (r.end >= 24 * 60 ? 1 : 0) as DayFlag;
+    const endOffset = r.end - endDay * 24 * 60;
+    const eH = Math.floor(endOffset / 60);
+    const eM = endOffset % 60;
+
+    return {
+      startDay,
+      start: `${pad2(sH)}:${pad2(sM)}`,
+      endDay,
+      end: `${pad2(eH)}:${pad2(eM)}`,
+    };
+  });
+
+  return { ranges, totalMinutes };
+};
+```
+
+> 这里仍然兼容你原有的 “次日 00:00” 表达方式：
+> 当 `r.end === 1440` 分钟时，会得到 `endDay=1, end='00:00'`，`formatTimeRange` 会显示成「次日 00:00」。
+
+---
+
+## 三、兼容原来的 `computeEffectiveRanges`（列表视图用）
+
+你当前在「有效时间视图」里用的是 `computeEffectiveRanges(detail)` 返回 `{label}` 数组。
+我们可以用刚才的 `computeEffectiveInfo` 来改造它：
+
+```tsx
+const computeEffectiveRanges = (
+  detail: ScheduleDetail,
+): { label: string }[] => {
+  const info = computeEffectiveInfo(detail);
+  if (info.ranges.length === 0) return [{ label: '无' }];
+  return info.ranges.map(r => ({
+    label: formatTimeRange(r.startDay, r.start, r.endDay, r.end),
   }));
-  setBulkSliceOpen(true);
 };
 ```
 
-* 如果用户先勾选了几条资源，再点「批量添加时间片」，弹框里会帮他把这些资源勾上。
-* 如果用户啥也没勾选就点按钮，`selectedRows.length === 0`，`resourceIds` 就是 `[]`，也就是你要的「默认不勾选任何资源」。
-
-弹框里资源那一块我们之前是这么写的（滚动列表 + 多选框），会自动根据 `bulkSliceConfig.resourceIds` 来勾选：
-
-```tsx
-{rows.map(r => (
-  <label key={r.id} ...>
-    <input
-      type="checkbox"
-      checked={bulkSliceConfig.resourceIds.includes(r.id)}
-      onChange={e => {
-        const checked = e.target.checked;
-        setBulkSliceConfig(cfg => ({
-          ...cfg,
-          resourceIds: checked
-            ? [...cfg.resourceIds, r.id]
-            : cfg.resourceIds.filter(id => id !== r.id),
-        }));
-      }}
-    />
-    <span>{r.name}</span>
-    <span className="text-muted">({r.code})</span>
-  </label>
-))}
-```
-
-所以只要 `resourceIds` 初始是 `[]`，就不会默认勾任何资源。
+这样，表格里的「有效时间视图」也会自动考虑不可用时间片，展示的时间段就是**扣掉请假/故障/保养之后的真实有效段**。
 
 ---
 
-## 3️⃣ 记得把新弹框纳入遮罩/统一关闭（小细节）
+## 四、排班详情抽屉里：同时显示「有效时间段」+「有效可用时长」
 
-你现在控制遮罩和统一关闭的逻辑是这样的：
-
-```tsx
-const closeAllLayers = () => {
-  setEditingDetail(null);
-  setPlanContext(null);
-  setRollContext(null);
-  setBulkPlanOpen(false);
-  setBulkDeleteOpen(false);
-};
-
-const anyLayerOpen = !!(
-  editingDetail ||
-  planContext ||
-  rollContext ||
-  bulkPlanOpen ||
-  bulkDeleteOpen
-);
-```
-
-加了「批量添加时间片」后，记得把 `bulkSliceOpen` 也加进去：
+原来你有一个 `effectiveLabelInDetail`：
 
 ```tsx
-const closeAllLayers = () => {
-  setEditingDetail(null);
-  setPlanContext(null);
-  setRollContext(null);
-  setBulkPlanOpen(false);
-  setBulkDeleteOpen(false);
-  setBulkSliceOpen(false);   // ✅ 新增
-};
-
-const anyLayerOpen = !!(
-  editingDetail ||
-  planContext ||
-  rollContext ||
-  bulkPlanOpen ||
-  bulkDeleteOpen ||
-  bulkSliceOpen        // ✅ 新增
-);
+const effectiveLabelInDetail = useMemo(() => {
+  if (!editingDetail) return '';
+  const ranges = computeEffectiveRanges({
+    slices: editingDetail.slices,
+  });
+  return ranges.map(r => r.label).join(' + ');
+}, [editingDetail]);
 ```
 
-这样点页面灰色遮罩时，这个弹框也会一起被关闭。
+现在我们想把 **时间段 + 时长** 一起算出来，可以改成这样：
+
+```tsx
+const effectiveInfoInDetail = useMemo(() => {
+  if (!editingDetail) {
+    return { label: '', hours: 0 };
+  }
+  const info = computeEffectiveInfo({
+    slices: editingDetail.slices,
+  });
+  const label = info.ranges.length
+    ? info.ranges
+        .map(r => formatTimeRange(r.startDay, r.start, r.endDay, r.end))
+        .join(' + ')
+    : '';
+  return {
+    label,
+    hours: info.totalMinutes / 60,
+  };
+}, [editingDetail]);
+```
+
+然后在抽屉内容里，把原来的两行说明改成这样：
+
+```tsx
+<div className="section-title">排班时间片</div>
+<div className="section-sub">
+  有效时间段：{effectiveInfoInDetail.label || '无'}
+</div>
+<div className="section-sub">
+  有效可用时长：
+  {effectiveInfoInDetail.hours > 0
+    ? `${effectiveInfoInDetail.hours.toFixed(1)} 小时`
+    : '0 小时'}
+</div>
+<div className="section-sub">
+  时间只维护时分，通过“今日/次日”标记是否跨天。
+</div>
+```
+
+> 你给的例子：
+>
+> * 常规：08:00–18:00 → 10 小时可用
+> * 请假：16:00–18:00（不可用）
+>   可用区间会被计算成：08:00–16:00（8 小时）
+>   抽屉里显示：
+> * 有效时间段：`08:00 ~ 16:00`
+> * 有效可用时长：`8.0 小时`
+>   完全符合「不可用时间片优先覆盖可用时间」的要求。
 
 ---
 
-## 4️⃣ 其他逻辑不用因这个需求再改
+## 五、效果总结
 
-* 之前写的 `executeBulkAddSlices` 按日期拆分时间范围、尽量避免跨天时间片的算法可以原样用；
-* 即使用户没预先勾选资源，只要在弹框里勾了几个资源，确认后逻辑也完全一样；
-* 若用户在弹框里也一个资源都不勾，`resourceIds` 是 `[]`，`executeBulkAddSlices` 里面一开始就可以直接 `setBulkSliceOpen(false); return;`，避免生成无意义数据。
+改完之后：
 
----
+1. **列表页「有效时间视图」**
+   显示的时间段已经自动扣掉了请假/故障/保养等不可用时间片。
+2. **详情抽屉**
 
-如果你愿意，我也可以帮你把：
-**现有 App.tsx + 新增状态 + 按钮 + Modal + 执行函数** 合成一个完整版本，方便直接覆盖粘贴。
+   * 「有效时间段」会按扣减后的区间拼出来；
+   * 「有效可用时长」是这些区间的总时长（分钟累加 / 60），例如 8.0 小时。
+3. 跨天时间片仍用原有的 `startDay/endDay` 方案表示，不会破坏你现在的显示逻辑。
+
+如果你愿意，我可以帮你把这些改动再整理成一份“完整 App.tsx 合并版”，方便直接对比 / 覆盖。
